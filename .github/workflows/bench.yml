@@ -70,10 +70,11 @@ jobs:
             for v in $names; do
               rm -rf /tmp/o
               printf "%s " $v
-              env $(cat /tmp/v/$v/env) DATA_DIR=/tmp/p20 OUTPUT_DIR=/tmp/o NCPU=4 /usr/bin/time -f "%e wall %U user %S sys" /tmp/v/$v/bin 2>&1 | tr '\n' ' ' | tee -a /tmp/res_$v; echo
+              env $(cat /tmp/v/$v/env) DATA_DIR=/tmp/p20 OUTPUT_DIR=/tmp/o NCPU=4 /usr/bin/time -f "%e wall %U user %S sys" /tmp/v/$v/bin 2>&1 | grep -v STEP | tr '\n' ' ' | tee -a /tmp/res_$v; echo
               echo >> /tmp/res_$v
             done
           done
+          for v in $names; do rm -rf /tmp/o; echo "STEPS $v"; env $(cat /tmp/v/$v/env) DATA_DIR=/tmp/p20 OUTPUT_DIR=/tmp/o NCPU=4 /tmp/v/$v/bin 2>&1 | grep STEP || true; done
           echo "== SUMMARY median wall"
           for v in $names; do
             m=$(grep -o '[0-9.]* wall' /tmp/res_$v | sort -n | sed -n 3p || true)

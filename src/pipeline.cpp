@@ -1545,6 +1545,9 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     u32 m = e.cnt;
     ClickE* cl = S.cl.data() + e.coff;
     u32 kc = e.ccnt;
+#ifdef EXP_WALK_NOCLICK
+    kc = 0;
+#endif
     if (kc > 1) {
       // sorted by ts; order equal-ts runs by click_id and drop duplicate copies
       u32 w = 0;
@@ -1588,7 +1591,9 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
         S.catsum[c] = 0;
       }
       S.cattouch.clear();
+#ifndef EXP_WALK_NOROW
       me.rows.push_back({e.key, (i32)(DAY0 + cur_day), top, d_sess, d_ev, d_rev});
+#endif
       d_sess = d_ev = d_rev = 0;
     };
     u32 i = 0;
