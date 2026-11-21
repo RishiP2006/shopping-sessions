@@ -49,6 +49,16 @@ jobs:
           python3 scripts/run_fixtures.py fixtures -- /tmp/pipeline | tail -1
           rm -rf /tmp/o && DATA_DIR=/tmp/dev OUTPUT_DIR=/tmp/o /tmp/pipeline 2>/dev/null
           cd scripts && python3 compare.py /tmp/o /tmp/ans/dev-answer | tail -1
+      - name: Variant correctness
+        run: |
+          for v in /tmp/v/*; do
+            echo "CHECK $(basename "$v")"
+            python3 scripts/run_fixtures.py fixtures -- "$v/bin" > /tmp/fixture-result
+            tail -1 /tmp/fixture-result
+            rm -rf /tmp/ov
+            env $(cat "$v/env") DATA_DIR=/tmp/dev OUTPUT_DIR=/tmp/ov NCPU=4 "$v/bin" 2>/dev/null
+            python3 scripts/compare.py /tmp/ov /tmp/ans/dev-answer
+          done
       - name: Docker image (scorer flags)
         run: |
           docker build -q -t shopping-sessions:latest . > /dev/null

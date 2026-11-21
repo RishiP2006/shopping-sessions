@@ -246,6 +246,19 @@ __attribute__((always_inline)) static inline bool civil_core(const char* p, i64&
   return true;
 }
 
+// ingest_ts is guaranteed to be valid F1 by the input contract.
+// Decode it without repeating the checks required for dirty event/click timestamps.
+__attribute__((always_inline)) static inline i64 parse_ingest(const char* p) {
+  u32 y = (u32)(p[0] - '0') * 1000 + (u32)(p[1] - '0') * 100 + (u32)(p[2] - '0') * 10 + (u32)(p[3] - '0');
+  u32 m = (u32)(p[5] - '0') * 10 + (u32)(p[6] - '0');
+  u32 d = (u32)(p[8] - '0') * 10 + (u32)(p[9] - '0');
+  u32 h = (u32)(p[11] - '0') * 10 + (u32)(p[12] - '0');
+  u32 mi = (u32)(p[14] - '0') * 10 + (u32)(p[15] - '0');
+  u32 sec = (u32)(p[17] - '0') * 10 + (u32)(p[18] - '0');
+  i64 day = y - TY0 < TYN ? g_mstart[(y - TY0) * 12 + m - 1] + (i64)d - 1 : days_from_civil(y, m, d);
+  return (day * 86400 + h * 3600 + mi * 60 + sec) * 1000;
+}
+
 // Date-hour cache: "YYYY-MM-DDTHH" (13 bytes, validated on insert) -> ms of that hour.
 // Data spans a few hundred distinct hours, so most timestamps only decode ":MM:SS".
 struct HourEnt {
@@ -543,6 +556,60 @@ static const char* scan_old(const char* p, const char* cend, const char* fend, b
   return ls < fend ? ls : fend;
 }
 
+// Line-relative masks avoid maintaining and shifting a three-block mask window.
+// The general scanner handles long lines and buffer tails with the same CSV rules.
+template <int N, class F>
+static const char* scan_line(const char* p, const char* cend, const char* fend, bool eof, F&& fn) {
+  Fld f[N];
+  while (p < cend && fend - p >= 128) {
+    u64 c0, q0, n0, c1 = 0, q1 = 0, n1 = 0;
+    masks64(p, c0, q0, n0);
+    u32 len;
+    if (n0) {
+      len = (u32)__builtin_ctzll(n0);
+      u64 mask = (1ULL << len) - 1;
+      c0 &= mask;
+      q0 &= mask;
+    } else {
+      masks64(p + 64, c1, q1, n1);
+      if (UNLIKELY(!n1)) {
+        const char* e = (const char*)memchr(p + 128, '\n', (size_t)(fend - p - 128));
+        if (!e) {
+          if (!eof) return p;
+          e = fend;
+        }
+        if (tok_scalar<N>(p, e, f)) fn(f);
+        p = e < fend ? e + 1 : fend;
+        continue;
+      }
+      u32 hi = (u32)__builtin_ctzll(n1);
+      len = 64 + hi;
+      u64 mask = (1ULL << hi) - 1;
+      c1 &= mask;
+      q1 &= mask;
+    }
+    const char* line = p;
+    p += len + 1;
+    if (UNLIKELY(__builtin_popcountll(c0) + __builtin_popcountll(c1) != N - 1)) continue;
+    u32 st = 0;
+    u32 pairs = 0;
+    for (int i = 0; i < N; i++) {
+      u32 end = i == N - 1 ? len : ctz2(c0, c1);
+      if (i != N - 1) {
+        if (c0) c0 &= c0 - 1; else c1 &= c1 - 1;
+      }
+      u32 n = end - st;
+      u32 quoted = (u32)(n >= 2) & (u32)(line[st] == '"') & (u32)(line[end ? end - 1 : 0] == '"');
+      f[i] = {line + st + quoted, n - 2 * quoted};
+      pairs += quoted;
+      st = end + 1;
+    }
+    if (UNLIKELY(pairs * 2 != (u32)(__builtin_popcountll(q0) + __builtin_popcountll(q1)))) continue;
+    fn(f);
+  }
+  return scan_old<N>(p, cend, fend, eof, fn);
+}
+
 static inline u32 tz64(u64 x) { return x ? (u32)__builtin_ctzll(x) : 64; }
 typedef unsigned __int128 u128;
 static inline u32 tz128(u128 x) {
@@ -557,6 +624,9 @@ static inline u32 pop128(u128 x) { return (u32)(__builtin_popcountll((u64)x) + _
 // Same contract as scan_old.
 template <int N, class F>
 static const char* scan(const char* p, const char* cend, const char* fend, bool eof, F&& fn) {
+#ifdef LINE_SCAN
+  return scan_line<N>(p, cend, fend, eof, fn);
+#endif
 #ifndef NEW_SCAN
   return scan_old<N>(p, cend, fend, eof, fn);
 #endif
@@ -1140,7 +1210,12 @@ static const char* parse_events(int tid, const char* p, const char* cend, const 
     k.eid = pack7(f[0].p, f[0].n);
     k.ref = NOREF;
     i64 ing;
+    #ifdef FAST_INGEST
+    if (LIKELY(f[3].n == 20)) ing = parse_ingest(f[3].p);
+    else if (!parse_ts(f[3].p, f[3].n, ing)) ing = (i64)1 << 60;
+#else
     if (UNLIKELY(!parse_ts(f[3].p, f[3].n, ing))) ing = (i64)1 << 60;
+#endif
     i64 ings = (ing - WS) / 1000;
     if (UNLIKELY(ings > INT32_MAX)) ings = INT32_MAX;
     if (UNLIKELY(ings < INT32_MIN)) ings = INT32_MIN;

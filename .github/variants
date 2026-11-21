@@ -1,4 +1,5 @@
-current HEAD --
-single HEAD -- -DSINGLE
-single_p1_16k HEAD -- -DSINGLE -DP1_TARGET=16384
-single_prof HEAD -- -DSINGLE -DPROF_STEPS
+baseline e34a706 --
+ingest HEAD -- -DFAST_INGEST
+line HEAD -- -DLINE_SCAN
+line_ingest HEAD -- -DLINE_SCAN -DFAST_INGEST
+line_ingest_lto HEAD -- -DLINE_SCAN -DFAST_INGEST -flto
