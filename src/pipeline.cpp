@@ -440,7 +440,7 @@ static const char* scan(const char* p, const char* cend, const char* fend, bool 
     }
     f[N - 1].p = line + st;
     f[N - 1].n = L - st;
-#ifdef QMASK
+#ifndef NO_QMASK
     if (qlo | qhi) {
       typedef unsigned __int128 u128;
       u128 Cm = (u128)clo0 | ((u128)chi0 << 64);
@@ -776,7 +776,9 @@ static int NT = 8;
 static i64 WS, WE, CB;
 static i64 DAY0;
 static int NDAYS;
-static int PBITS, P;
+static int PBITS, P;      // user partitions (payload, raw clicks)
+static int P1BITS, P1;    // event_id partitions (dedup keys)
+static int P2BITS, P2;    // person partitions (sessions)
 static SmallTab g_prod;
 static SmallTab g_camp;
 static std::vector<std::string> g_cats;
@@ -917,8 +919,8 @@ static bool find_json_str(const std::string& s, const char* key, std::string& ou
 }
 
 // ---------------------------------------------------------------- phase 1: parse
-static inline u32 p1_of(u64 eid) { return (u32)(hmix(eid, K1) >> (64 - PBITS)); }
-static inline u32 p2_of(u64 person) { return (u32)(hmix(person, K2) >> (64 - PBITS)); }
+static inline u32 p1_of(u64 eid) { return (u32)(hmix(eid, K1) >> (64 - P1BITS)); }
+static inline u32 p2_of(u64 person) { return (u32)(hmix(person, K2) >> (64 - P2BITS)); }
 
 static inline u32 pu_of(u64 user) { return (u32)(hmix(user, K4) >> (64 - PBITS)); }
 
@@ -1669,17 +1671,33 @@ int main() {
 #endif
   while ((1ull << PBITS) * (u64)PART_TARGET < ev_est && PBITS < 12) PBITS++;
   P = 1 << PBITS;
+#ifndef P1_TARGET
+#define P1_TARGET PART_TARGET
+#endif
+#ifndef P2_TARGET
+#define P2_TARGET PART_TARGET
+#endif
+  P1BITS = 4;
+  while ((1ull << P1BITS) * (u64)P1_TARGET < ev_est && P1BITS < 13) P1BITS++;
+  P1 = 1 << P1BITS;
+  P2BITS = 4;
+  while ((1ull << P2BITS) * (u64)P2_TARGET < ev_est && P2BITS < 13) P2BITS++;
+  P2 = 1 << P2BITS;
   g_links.init(link_bytes / 10 + 1024);
   size_t cap_per = ev_est / ((size_t)NT * P);
+  size_t cap1 = ev_est / ((size_t)NT * P1);
+  cap1 = cap1 + cap1 / 16 + 32;
+  size_t cap2 = ev_est / ((size_t)NT * P2);
+  cap2 = cap2 + cap2 / 16 + 32;
   cap_per = cap_per + cap_per / 16 + 32;
-  g_keys.init(cap_per, NT, P);
+  g_keys.init(cap1, NT, P1);
   g_pay.init(cap_per, NT, P);
   g_loser = (std::atomic<u64>*)big_alloc((g_pay.total_n / 64 + 1) * sizeof(u64));
   size_t click_est = click_bytes / 44 + 1024;
   size_t ccap = click_est / ((size_t)NT * P);
   ccap = ccap + ccap / 16 + 16;
   g_craw.init(ccap, NT, P);
-  g_cper.init(ccap, NT, P);
+  g_cper.init(click_est / ((size_t)NT * P2) + click_est / ((size_t)NT * P2) / 16 + 16, NT, P2);
   logt("setup");
 
   std::vector<Chunk> chunks;
@@ -1721,7 +1739,7 @@ int main() {
       DedupScratch S;
       while (true) {
         u32 p = nx.fetch_add(1);
-        if (p >= (u32)P) break;
+        if (p >= (u32)P1) break;
         dedup_partition(p, S);
       }
     });
@@ -1729,7 +1747,10 @@ int main() {
   logt("dedup");
   // phase 2b: map persons, scatter by person
   {
-    g_rec2.init(cap_per, NT, P, g_keys.base, g_keys.total_n);  // keys are dead: reuse their memory
+    if (PartBuf<Rec2>::total_for(cap2, NT, P2) <= g_keys.total_n)
+      g_rec2.init(cap2, NT, P2, g_keys.base, g_keys.total_n);  // keys are dead: reuse their memory
+    else
+      g_rec2.init(cap2, NT, P2);
     std::atomic<u32> nx{0};
     parallel(NT, [&](int tid) {
       while (true) {
@@ -1745,7 +1766,7 @@ int main() {
   // phase 3
   {
     std::vector<std::pair<size_t, u32>> order;
-    for (u32 q = 0; q < (u32)P; q++) {
+    for (u32 q = 0; q < (u32)P2; q++) {
       size_t n = 0;
       for (int t = 0; t < NT; t++) n += g_rec2.count(t, q);
       order.push_back({n, q});
