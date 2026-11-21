@@ -544,7 +544,7 @@ static inline u32 pop128(u128 x) { return (u32)(__builtin_popcountll((u64)x) + _
 // Same contract as scan_old.
 template <int N, class F>
 static const char* scan(const char* p, const char* cend, const char* fend, bool eof, F&& fn) {
-#ifdef OLD_SCAN
+#ifndef NEW_SCAN
   return scan_old<N>(p, cend, fend, eof, fn);
 #endif
   static thread_local std::vector<u64> MV;
