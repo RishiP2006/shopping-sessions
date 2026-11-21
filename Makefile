@@ -27,3 +27,10 @@ native:
 
 native-fixtures: native
 	python3 scripts/run_fixtures.py $(FIXTURES) -- build/pipeline
+
+# SIMD boundary/quoting differential checks, with memory and UB sanitizers.
+.PHONY: scanner-check
+scanner-check:
+	mkdir -p build
+	$(CXX) -O1 -g -march=native -std=c++17 -pthread -fsanitize=address,undefined -o build/check-scanner tools/check_scanner.cpp
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 build/check-scanner

@@ -78,6 +78,11 @@ static void run() {
   }
 }
 int main() {
+  // Commas always delimit fields, including inside incorrectly placed quotes.
+  std::string bad = "\"" + std::string(200, 'a') + ",b\",c";
+  Fld fields[2];
+  assert(!tok_scalar<2>(bad.data(), bad.data() + bad.size(), fields));
+  check<2>(bad, bad.size(), true);
   run<2>(); run<4>(); run<7>();
-  puts("180000 scanner comparisons passed");
+  puts("180000 scanner comparisons and regression checks passed");
 }

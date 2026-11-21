@@ -7,9 +7,12 @@ image, about 1.5 MB. It implements `rules.md` and writes `/output/user_daily/*.p
 ## How it works
 
 1. **Parse** (all threads). Files are read with `pread` in 4 MB chunks into 256 KB buffers that stay in
-   cache. A SIMD scanner (AVX2 on x86) builds comma/quote/newline bitmasks per 64-byte block and cuts
-   each line with a fixed number of bit operations. Quotes are validated with mask arithmetic.
-   Timestamps use SWAR (all three forms). IDs up to 9 ASCII chars pack exactly into 63 bits, so
+   cache. A SIMD scanner (AVX2 on x86) builds line-relative comma/quote/newline masks, avoiding
+   shifts across a rolling three-block window. Quote counts must match whole-field quote pairs;
+   long lines and buffer tails use the general parser. A small date table derived from the manifest
+   checks exact date bytes before reusing a decoded day; other dates use the complete calendar
+   decoder. `ingest_ts` uses the rules' guarantee that it is valid F1. IDs up to 9 ASCII chars
+   pack exactly into 63 bits, so
    numeric order equals byte order; anything else is interned.
    Links are parsed first into a lock-free hash table, and one thread runs union-find (each person is
    named by the smallest ID) while the others keep parsing.
@@ -27,6 +30,11 @@ image, about 1.5 MB. It implements `rules.md` and writes `/output/user_daily/*.p
 ## Testing
 
 - `make native-fixtures`: the 36 edge-case fixtures.
+- `make scanner-check`: 180,000 randomized comparisons against the scalar tokenizer, covering
+  quoting, malformed rows, long fields, partial reads and chunk boundaries under ASan/UBSan.
+  Regression checks cover malformed quotes crossing commas. The pipeline also passes all 36
+  fixtures under ASan/UBSan; numeric Parquet stores use `memcpy` for unaligned destinations,
+  and the 16-digit epoch parser avoids shifting a 64-bit integer by 64.
 - Dev set: `make run-dev DEV=path/to/dev && make check-dev ANSWER=path/to/dev-answer`
 - `tools/reference.py`: a slow, literal reference implementation. `tools/cross.sh` checks other
   generator seeds against it; `tools/torture.sh` checks randomized adversarial inputs (long lines,
@@ -34,7 +42,8 @@ image, about 1.5 MB. It implements `rules.md` and writes `/output/user_daily/*.p
   vars shrink buffers to exercise boundary handling.
 - The `bench` branch has a GitHub Actions workflow (`.github/workflows/bench.yml`). It builds the real
   image, runs fixtures and the dev set with the scorer's flags, and A/B-times the variants listed in
-  `.github/variants` on 20M events.
+  `.github/variants` on 20M events. It also extracts and times the production Docker binary, then
+  compares its full output with the original implementation on a new 60M-event dataset.
 
 Opt-in experiments (compile flags, all slower or neutral on x86): `SINGLE`, `PARSE_LOOKUP`, `USE_WC`,
-`USE_MMAP`, `NEW_SCAN`, `HOURCACHE`, `SESS_PERSORT`, `PROF_STEPS` (per-step timers).
+`USE_MMAP`, `OLD_SCAN`, `NEW_SCAN`, `HOURCACHE`, `SESS_PERSORT`, `PROF_STEPS` (per-step timers).

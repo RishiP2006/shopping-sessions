@@ -37,16 +37,9 @@ jobs:
           while read -r name ref rest; do
             [ -z "$name" ] && continue
             envs="${rest%%--*}"; flags="${rest#*--}"
-            if [[ "$name" == *avx512* ]] && ! grep -q avx512bw /proc/cpuinfo; then echo "SKIP $name: CPU lacks AVX-512"; continue; fi
             mkdir -p /tmp/v/$name
             if [ "$ref" = HEAD ]; then cp src/pipeline.cpp src/parquet.hpp /tmp/v/$name/; else
               git show $ref:src/pipeline.cpp > /tmp/v/$name/pipeline.cpp; git show $ref:src/parquet.hpp > /tmp/v/$name/parquet.hpp; fi
-            if [[ "$name" == pgo* ]]; then
-              g++ -O3 -march=haswell -mtune=skylake-avx512 -std=c++17 -static -pthread $flags -fprofile-generate=/tmp/v/$name/profile -fprofile-update=atomic -o /tmp/v/$name/bin /tmp/v/$name/pipeline.cpp
-              rm -rf /tmp/pgo-out
-              SS_PROFILE=1 DATA_DIR=/tmp/dev OUTPUT_DIR=/tmp/pgo-out NCPU=4 /tmp/v/$name/bin 2>/dev/null
-              flags="$flags -fprofile-use=/tmp/v/$name/profile -fprofile-correction"
-            fi
             g++ -O3 -march=haswell -mtune=skylake-avx512 -std=c++17 -static -pthread $flags -o /tmp/v/$name/bin /tmp/v/$name/pipeline.cpp
             echo "$envs" > /tmp/v/$name/env
             echo "variant $name ref=$ref env=[$envs] flags=[$flags]"
@@ -83,6 +76,13 @@ jobs:
             CPUS=4 MEM=12g scripts/docker_run.sh /tmp/p20 /tmp/od 2>/dev/null
             e=$(date +%s.%N); echo "docker p20 run: $(echo "$e - $s" | bc) s"
           done
+      - name: Extract production binary
+        run: |
+          mkdir -p /tmp/v/docker
+          id=$(docker create shopping-sessions:latest)
+          docker cp "$id:/pipeline" /tmp/v/docker/bin
+          docker rm "$id" >/dev/null
+          touch /tmp/v/docker/env
       - name: Bench
         run: |
           cat /tmp/p20/*/*.csv > /dev/null
@@ -101,6 +101,15 @@ jobs:
             m=$(grep -o '[0-9.]* wall' /tmp/res_$v | sort -n | sed -n 3p || true)
             echo "SUM $v $m"
           done
+      - name: Full-size correctness and scaling
+        run: |
+          G=/tmp/gen/generator/target/release/generate
+          $G --seed 37 --events 60000000 --clicks 15000000 --output /tmp/f60 >/dev/null
+          for name in baseline docker; do
+            echo "FULL60 $name"
+            env DATA_DIR=/tmp/f60 OUTPUT_DIR=/tmp/f60-$name NCPU=4 /usr/bin/time -f "%e wall %M maxrss-kb" /tmp/v/$name/bin
+          done
+          python3 scripts/compare.py /tmp/f60-docker /tmp/f60-baseline
       - name: Profile
         continue-on-error: true
         run: |
