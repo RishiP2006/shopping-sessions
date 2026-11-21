@@ -2,3 +2,4 @@ out/
 dev/
 build/
 *.o
+.DS_Store
