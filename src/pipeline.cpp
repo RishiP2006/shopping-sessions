@@ -242,7 +242,7 @@ struct HourEnt {
 static thread_local HourEnt g_hc[1024];
 template <bool ZULU>
 __attribute__((always_inline)) static inline bool civil_cached(const char* p, i64& out) {
-#ifndef NO_HOURCACHE
+#ifdef HOURCACHE
   u64 a, b, t;
   memcpy(&a, p, 8);
   memcpy(&b, p + 8, 8);
@@ -406,7 +406,7 @@ static inline u32 ctz2(u64 lo, u64 hi) { return lo ? (u32)__builtin_ctzll(lo) : 
 // Masks are computed once per 64-byte block into a 3-block window; each line is then cut
 // with a fixed number of bit extractions.
 template <int N, class F>
-static const char* scan(const char* p, const char* cend, const char* fend, bool eof, F&& fn) {
+static const char* scan_old(const char* p, const char* cend, const char* fend, bool eof, F&& fn) {
   Fld f[N];
   const char* base = p;
   u64 C0, Q0, N0, C1, Q1, N1, C2, Q2, N2;
@@ -528,6 +528,105 @@ static const char* scan(const char* p, const char* cend, const char* fend, bool 
     fn(f);
   }
   return ls < fend ? ls : fend;
+}
+
+static inline u32 tz64(u64 x) { return x ? (u32)__builtin_ctzll(x) : 64; }
+typedef unsigned __int128 u128;
+static inline u32 tz128(u128 x) {
+  u64 lo = (u64)x, hi = (u64)(x >> 64);
+  u32 tl = tz64(lo), th = tz64(hi);
+  return tl + (lo == 0 ? th : 0);
+}
+static inline u32 pop128(u128 x) { return (u32)(__builtin_popcountll((u64)x) + __builtin_popcountll((u64)(x >> 64))); }
+
+// Two-stage scanner: stage 1 computes comma/quote/newline masks for every 64-byte block
+// of [p, fend); stage 2 cuts lines branch-free from a 3-block window of those masks.
+// Same contract as scan_old.
+template <int N, class F>
+static const char* scan(const char* p, const char* cend, const char* fend, bool eof, F&& fn) {
+#ifdef OLD_SCAN
+  return scan_old<N>(p, cend, fend, eof, fn);
+#endif
+  static thread_local std::vector<u64> MV;
+  const size_t len = (size_t)(fend - p);
+  const size_t nb = (len + 63) / 64;
+  if (MV.size() < (nb + 4) * 3) MV.resize((nb + 4) * 3 + 1024);
+  u64* M = MV.data();  // triples: C, Q, N per block
+  for (size_t b = 0; b < nb; b++) {
+    u64 c, q, nl;
+    masks64(p + b * 64, c, q, nl);
+    M[3 * b] = c;
+    M[3 * b + 1] = q;
+    M[3 * b + 2] = nl;
+  }
+  if (len & 63) {
+    u64 vm = (1ULL << (len & 63)) - 1;
+    M[3 * (nb - 1)] &= vm;
+    M[3 * (nb - 1) + 1] &= vm;
+    M[3 * (nb - 1) + 2] &= vm;
+  }
+  for (size_t b = nb; b < nb + 3; b++) M[3 * b] = M[3 * b + 1] = M[3 * b + 2] = 0;
+  Fld f[N];
+  size_t off = 0;
+  while (off < len) {
+    if (p + off >= cend) return p + off;
+    const size_t blk = off >> 6;
+    const u32 sh = (u32)(off & 63), rs = 63 - sh;
+    const u64* w = M + 3 * blk;
+    u64 nlo = (w[2] >> sh) | ((w[5] << 1) << rs), nhi = (w[5] >> sh) | ((w[8] << 1) << rs);
+    const char* line = p + off;
+    u32 L;
+    if (LIKELY(nlo | nhi)) {
+      L = tz128((u128)nlo | ((u128)nhi << 64));
+    } else {
+      size_t avail = len - off;
+      if (avail >= 128) {
+        const char* e = (const char*)memchr(line + 128, '\n', avail - 128);
+        if (!e) {
+          if (!eof) return line;
+          e = fend;
+        }
+        if (tok_scalar<N>(line, e, f)) fn(f);
+        off = (size_t)(e - p) + 1;
+        continue;
+      }
+      if (!eof) return line;
+      L = (u32)avail;
+    }
+    off += L + 1;
+    u128 lm = (((u128)1) << L) - 1;
+    u128 Cm = ((u128)((w[0] >> sh) | ((w[3] << 1) << rs)) | ((u128)((w[3] >> sh) | ((w[6] << 1) << rs)) << 64)) & lm;
+    if (UNLIKELY(pop128(Cm) != (u32)(N - 1))) continue;
+    u128 Qm = ((u128)((w[1] >> sh) | ((w[4] << 1) << rs)) | ((u128)((w[4] >> sh) | ((w[7] << 1) << rs)) << 64)) & lm;
+    u128 Cx = Cm;
+    u32 st = 0;
+    for (int i = 0; i < N - 1; i++) {
+      u32 e = tz128(Cx);
+      Cx &= Cx - 1;
+      f[i].p = line + st;
+      f[i].n = e - st;
+      st = e + 1;
+    }
+    f[N - 1].p = line + st;
+    f[N - 1].n = L - st;
+    if (Qm) {
+      u128 one = 1;
+      u128 SEP = Cm | (one << L);
+      u128 FS = ((Cm << 1) | one) & lm;
+      u128 FE = SEP >> 1;
+      u128 QS = Qm & FS, QE = Qm & FE;
+      u128 Mm = ~SEP & lm;
+      if (UNLIKELY(Qm != (QS | QE) || QE != (((Mm + QS) & SEP) >> 1) || (QS & QE))) continue;
+      for (int i = 0; i < N; i++) {
+        u32 s0 = (u32)(f[i].p - line);
+        u32 has = (u32)(QS >> s0) & 1;
+        f[i].p += has;
+        f[i].n -= 2 * has;
+      }
+    }
+    fn(f);
+  }
+  return fend;
 }
 
 // Generic scalar tokenizer for one line [p, e) (small files).
@@ -1030,13 +1129,13 @@ static const char* parse_events(int tid, const char* p, const char* cend, const 
       u32 pc = 0;
       const char* t = f[4].p;
       u32 w4;
+      u64 w8;
       memcpy(&w4, t, 4);
-      if (f[4].n == 4) {
-        if (w4 != 0x77656976u /*view*/ && w4 != 0x74726163u /*cart*/) break;
-      } else {
-        u64 w8;
-        memcpy(&w8, t, 8);
-        if (f[4].n != 8 || w8 != 0x6573616863727570ULL /*purchase*/) break;
+      memcpy(&w8, t, 8);
+      u32 isv = (u32)(f[4].n == 4) & ((u32)(w4 == 0x77656976u /*view*/) | (u32)(w4 == 0x74726163u /*cart*/));
+      u32 isp = (u32)(f[4].n == 8) & (u32)(w8 == 0x6573616863727570ULL /*purchase*/);
+      if (UNLIKELY(!(isv | isp))) break;
+      if (UNLIKELY(isp)) {
         u32 price;
         if (!parse_price(f[6].p, f[6].n, price)) break;
         u32 cat;

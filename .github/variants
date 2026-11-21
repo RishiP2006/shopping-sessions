@@ -1,3 +1,3 @@
 new HEAD --
-nohourcache HEAD -- -DNO_HOURCACHE
-prev 45789c1d26ce8a29195baf136f0d5f940a8ae8d2 -- -DNO_PARSE_LOOKUP
+oldscan HEAD -- -DOLD_SCAN
+prev 58d8ae793e4cb948b110cd85cac0a7f6c3affb18 -- -DNO_PARSE_LOOKUP -DNO_HOURCACHE
