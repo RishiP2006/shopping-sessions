@@ -326,72 +326,112 @@ static inline void masks64(const char* p, u64& c, u64& q, u64& nl) {
 #endif
 }
 
+// Generic scalar tokenizer for one line [p, e).
+template <int N>
+static bool tok_scalar(const char* p, const char* e, Fld* f);
+
+static inline u32 ctz2(u64 lo, u64 hi) { return lo ? (u32)__builtin_ctzll(lo) : 64 + (u32)__builtin_ctzll(hi); }
+
 // Scan lines starting at p (a line start) while the line start is < cend.
-// fend is the end of the file; >= 64 readable bytes follow it.
+// fend is the end of valid data; >= 192 readable bytes follow it. If eof, a final line
+// without '\n' is complete; otherwise it is left unprocessed. Returns the start of the
+// first line not processed.
+// Masks are computed once per 64-byte block into a 3-block window; each line is then cut
+// with a fixed number of bit extractions.
 template <int N, class F>
-static void scan(const char* p, const char* cend, const char* fend, F&& fn) {
+static const char* scan(const char* p, const char* cend, const char* fend, bool eof, F&& fn) {
   Fld f[N];
-  u32 nf = 0;
-  const char* fs = p;
-  const char* blk = p;
-  u32 qacc = 0, qline0 = 0;
-  auto finish = [&](u32 qnow) {
-    if (nf == N) {
-      u32 ql = qnow - qline0;
-      if (UNLIKELY(ql != 0)) {
-        u32 pairs = 0;
-        for (int i = 0; i < N; i++) {
-          if (f[i].n >= 2 && f[i].p[0] == '"' && f[i].p[f[i].n - 1] == '"') {
-            pairs++;
-            f[i].p++;
-            f[i].n -= 2;
-          }
-        }
-        if (pairs * 2 != ql) return;
-      }
-      fn(f);
+  const char* base = p;
+  u64 C0, Q0, N0, C1, Q1, N1, C2, Q2, N2;
+  auto blockmask = [&](const char* b, u64& c, u64& q, u64& nl) {
+    masks64(b, c, q, nl);
+    if (UNLIKELY(b + 64 > fend)) {
+      u64 vm = b >= fend ? 0 : ((1ULL << (fend - b)) - 1);
+      c &= vm;
+      q &= vm;
+      nl &= vm;
     }
   };
-  while (blk < fend) {
-    u64 C, Q, NL;
-    masks64(blk, C, Q, NL);
-    size_t rem = (size_t)(fend - blk);
-    if (UNLIKELY(rem < 64)) {
-      u64 vm = (1ULL << rem) - 1;
-      C &= vm;
-      Q &= vm;
-      NL &= vm;
+  blockmask(base, C0, Q0, N0);
+  blockmask(base + 64, C1, Q1, N1);
+  blockmask(base + 128, C2, Q2, N2);
+  const char* ls = p;
+  while (ls < fend) {
+    if (ls >= cend) return ls;
+    size_t o = (size_t)(ls - base);
+    while (o >= 64) {
+      base += 64;
+      o -= 64;
+      C0 = C1; Q0 = Q1; N0 = N1;
+      C1 = C2; Q1 = Q2; N1 = N2;
+      blockmask(base + 128, C2, Q2, N2);
     }
-    u64 S = C | NL;
-    while (S) {
-      u32 pos = (u32)__builtin_ctzll(S);
-      S &= S - 1;
-      const char* e = blk + pos;
-      if (LIKELY(nf < (u32)N)) {
-        f[nf].p = fs;
-        f[nf].n = (u32)(e - fs);
+    const u32 sh = (u32)o, rs = 63 - sh;
+    u64 nlo = (N0 >> sh) | ((N1 << 1) << rs), nhi = (N1 >> sh) | ((N2 << 1) << rs);
+    u32 L;
+    if (LIKELY(nlo | nhi)) {
+      L = ctz2(nlo, nhi);
+    } else {
+      size_t avail = (size_t)(fend - ls);
+      if (avail >= 128) {
+        // a line of 128+ bytes: slow path
+        const char* e = (const char*)memchr(ls + 128, '\n', avail - 128);
+        if (!e) {
+          if (!eof) return ls;
+          e = fend;
+        }
+        if (tok_scalar<N>(ls, e, f)) fn(f);
+        ls = e + 1;
+        base = ls;
+        if (ls < fend) {
+          blockmask(base, C0, Q0, N0);
+          blockmask(base + 64, C1, Q1, N1);
+          blockmask(base + 128, C2, Q2, N2);
+        }
+        continue;
       }
-      nf++;
-      fs = e + 1;
-      if ((NL >> pos) & 1) {
-        u32 qnow = qacc + (u32)__builtin_popcountll(Q & ((1ULL << pos) - 1));
-        finish(qnow);
-        nf = 0;
-        qline0 = qnow;
-        if (fs >= cend) return;
+      if (!eof) return ls;
+      L = (u32)avail;  // final line without newline
+    }
+    u64 clo = (C0 >> sh) | ((C1 << 1) << rs), chi = (C1 >> sh) | ((C2 << 1) << rs);
+    u64 qlo = (Q0 >> sh) | ((Q1 << 1) << rs), qhi = (Q1 >> sh) | ((Q2 << 1) << rs);
+    // keep bits < L
+    u64 mlo = L >= 64 ? ~0ULL : ((1ULL << L) - 1);
+    u64 mhi = L <= 64 ? 0 : (L >= 128 ? ~0ULL : ((1ULL << (L - 64)) - 1));
+    clo &= mlo;
+    chi &= mhi;
+    qlo &= mlo;
+    qhi &= mhi;
+    const char* line = ls;
+    ls += L + 1;
+    if (UNLIKELY((u32)(__builtin_popcountll(clo) + __builtin_popcountll(chi)) != (u32)(N - 1))) continue;
+    u32 st = 0;
+    for (int i = 0; i < N - 1; i++) {
+      u32 e = ctz2(clo, chi);
+      if (clo) clo &= clo - 1; else chi &= chi - 1;
+      f[i].p = line + st;
+      f[i].n = e - st;
+      st = e + 1;
+    }
+    f[N - 1].p = line + st;
+    f[N - 1].n = L - st;
+    if (qlo | qhi) {
+      u32 qc = (u32)(__builtin_popcountll(qlo) + __builtin_popcountll(qhi));
+      u32 pairs = 0;
+      for (int i = 0; i < N; i++) {
+        const char* fp = f[i].p;
+        u32 n = f[i].n;
+        u32 last = n ? n - 1 : 0;
+        u32 isq = (u32)(n >= 2) & (u32)(fp[0] == '"') & (u32)(fp[last] == '"');
+        f[i].p = fp + isq;
+        f[i].n = n - 2 * isq;
+        pairs += isq;
       }
+      if (pairs * 2 != qc) continue;
     }
-    qacc += (u32)__builtin_popcountll(Q);
-    blk += 64;
+    fn(f);
   }
-  if (nf > 0 || fs < fend) {
-    if (nf < (u32)N) {
-      f[nf].p = fs;
-      f[nf].n = (u32)(fend - fs);
-    }
-    nf++;
-    finish(qacc);
-  }
+  return ls < fend ? ls : fend;
 }
 
 // Generic scalar tokenizer for one line [p, e) (small files).
@@ -635,7 +675,7 @@ static std::vector<std::string> g_camp_id, g_camp_ch;
 static LinkTab g_links;
 
 struct FileMap {
-  const char* data;
+  int fd;
   size_t size;
   int kind;  // 0 events, 1 clicks, 2 links
 };
@@ -694,8 +734,7 @@ static std::vector<std::string> list_csv(const std::string& dir) {
   return out;
 }
 
-// Map a file with >= 64 KiB of zero padding after it.
-static void map_file(const std::string& path, int kind) {
+static void open_file(const std::string& path, int kind) {
   int fd = open(path.c_str(), O_RDONLY);
   if (fd < 0) return;
   struct stat st;
@@ -705,21 +744,7 @@ static void map_file(const std::string& path, int kind) {
     close(fd);
     return;
   }
-  size_t pg = (size_t)sysconf(_SC_PAGESIZE);
-  size_t mapped = (n + pg - 1) / pg * pg;
-  size_t total = mapped + (64 << 10);
-  void* res = mmap(nullptr, total, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (res == MAP_FAILED) {
-    fprintf(stderr, "mmap reserve failed\n");
-    exit(1);
-  }
-  void* m = mmap(res, n, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
-  close(fd);
-  if (m == MAP_FAILED) {
-    fprintf(stderr, "mmap %s failed\n", path.c_str());
-    exit(1);
-  }
-  g_files.push_back({(const char*)m, n, kind});
+  g_files.push_back({fd, n, kind});
 }
 
 template <int N, class F>
@@ -758,9 +783,9 @@ static inline u32 p2_of(u64 person) { return (u32)(hmix(person, K2) >> (64 - PBI
 
 static inline u32 pu_of(u64 user) { return (u32)(hmix(user, K4) >> (64 - PBITS)); }
 
-static void parse_events(int tid, const char* p, const char* cend, const char* fend) {
+static const char* parse_events(int tid, const char* p, const char* cend, const char* fend, bool eof) {
   const i64 wlen = WE - WS;
-  scan<7>(p, cend, fend, [&](Fld* f) {
+  return scan<7>(p, cend, fend, eof, [&](Fld* f) {
     if (UNLIKELY(f[0].n == 0)) return;
     EKey k;
     k.eid = pack7(f[0].p, f[0].n);
@@ -805,9 +830,9 @@ static void parse_events(int tid, const char* p, const char* cend, const char* f
   });
 }
 
-static void parse_clicks(int tid, const char* p, const char* cend, const char* fend) {
+static const char* parse_clicks(int tid, const char* p, const char* cend, const char* fend, bool eof) {
   const i64 clen = WE - CB;
-  scan<4>(p, cend, fend, [&](Fld* f) {
+  return scan<4>(p, cend, fend, eof, [&](Fld* f) {
     if (f[0].n == 0 || f[1].n == 0 || f[2].n == 0) return;
     i64 ts;
     if (!parse_ts(f[3].p, f[3].n, ts)) return;
@@ -824,9 +849,9 @@ static void parse_clicks(int tid, const char* p, const char* cend, const char* f
   });
 }
 
-static void parse_links(int tid, const char* p, const char* cend, const char* fend) {
+static const char* parse_links(int tid, const char* p, const char* cend, const char* fend, bool eof) {
   TL& tl = g_tl[tid];
-  scan<2>(p, cend, fend, [&](Fld* f) {
+  return scan<2>(p, cend, fend, eof, [&](Fld* f) {
     if (f[0].n == 0 || f[1].n == 0) return;
     u32 a = g_links.insert(pack7(f[0].p, f[0].n), tl.fresh);
     u32 b = g_links.insert(pack7(f[1].p, f[1].n), tl.fresh);
@@ -1286,6 +1311,62 @@ static void write_campaign_file(const std::string& path, const std::vector<CD>& 
   }
 }
 
+static size_t RDBUF = 256 << 10;
+
+// Read chunk [beg, end) of a file with pread into a reusable buffer and parse every line
+// that starts inside it.
+static void process_chunk(int tid, const Chunk& c, std::vector<char>& vb) {
+  const FileMap& fi = g_files[c.file];
+  size_t cap = vb.size() - 512;
+  char* buf = vb.data();
+  size_t boff = c.beg == 0 ? 0 : c.beg - 1;  // file offset of buf[0]
+  size_t roff = boff;
+  size_t keep = 0;
+  bool skip = true;  // skip the header (beg == 0) or up to the first line start >= beg
+  while (true) {
+    if (keep == cap) {
+      vb.resize(cap * 2 + 512);
+      buf = vb.data();
+      cap = vb.size() - 512;
+    }
+    size_t want = std::min(cap - keep, fi.size - roff);
+    ssize_t n = want ? pread(fi.fd, buf + keep, want, (off_t)roff) : 0;
+    if (n < 0) {
+      perror("pread");
+      exit(1);
+    }
+    roff += (size_t)n;
+    size_t len = keep + (size_t)n;
+    bool eof = roff >= fi.size || n == 0;
+    const char* p = buf;
+    const char* fend = buf + len;
+    if (skip) {
+      const char* nl = (const char*)memchr(p, '\n', len);
+      if (!nl) {
+        if (eof) return;
+        keep = 0;
+        boff = roff;
+        continue;
+      }
+      p = nl + 1;
+      skip = false;
+    }
+    const char* cend = (c.end - boff <= len) ? buf + (c.end - boff) : fend + 1;
+    if (p >= cend) return;
+    const char* r;
+    if (fi.kind == 0)
+      r = parse_events(tid, p, cend, fend, eof);
+    else if (fi.kind == 1)
+      r = parse_clicks(tid, p, cend, fend, eof);
+    else
+      r = parse_links(tid, p, cend, fend, eof);
+    if (eof || r >= cend) return;
+    keep = (size_t)(fend - r);
+    memmove(buf, r, keep);
+    boff += (size_t)(r - buf);
+  }
+}
+
 template <class F>
 static void parallel(int nt, F fn) {
   std::vector<std::thread> th;
@@ -1376,9 +1457,9 @@ int main() {
     }
   }
   size_t ev_bytes = 0, link_bytes = 0, click_bytes = 0;
-  for (auto& f : list_csv(DATA + "/links")) map_file(f, 2);
-  for (auto& f : list_csv(DATA + "/events")) map_file(f, 0);
-  for (auto& f : list_csv(DATA + "/clicks")) map_file(f, 1);
+  for (auto& f : list_csv(DATA + "/links")) open_file(f, 2);
+  for (auto& f : list_csv(DATA + "/events")) open_file(f, 0);
+  for (auto& f : list_csv(DATA + "/clicks")) open_file(f, 1);
   for (auto& f : g_files) {
     if (f.kind == 0) ev_bytes += f.size;
     if (f.kind == 2) link_bytes += f.size;
@@ -1386,7 +1467,7 @@ int main() {
   }
   size_t ev_est = ev_bytes / 74 + 1024;
   PBITS = 4;
-  while ((1ull << PBITS) * 16384ull < ev_est && PBITS < 12) PBITS++;
+  while ((1ull << PBITS) * 65536ull < ev_est && PBITS < 12) PBITS++;
   P = 1 << PBITS;
   g_links.init(link_bytes / 10 + 1024);
   size_t cap_per = ev_est / ((size_t)NT * P);
@@ -1402,7 +1483,9 @@ int main() {
   logt("setup");
 
   std::vector<Chunk> chunks;
-  const size_t CH = 2 << 20;
+  size_t CH = 4 << 20;
+  if ((e = getenv("SS_CHUNK")) && atol(e) > 0) CH = (size_t)atol(e);
+  if ((e = getenv("SS_RDBUF")) && atol(e) > 0) RDBUF = (size_t)atol(e);
   int nlinkchunks = 0;
   for (int kind : {2, 0, 1}) {
     for (int fi = 0; fi < (int)g_files.size(); fi++) {
@@ -1419,31 +1502,12 @@ int main() {
   std::atomic<int> links_left{nlinkchunks};
   if (nlinkchunks == 0) run_union_find();
   parallel(NT, [&](int tid) {
+    std::vector<char> vb(RDBUF + 512);
     while (true) {
       size_t ci = next_chunk.fetch_add(1);
       if (ci >= chunks.size()) break;
-      Chunk c = chunks[ci];
-      const FileMap& fm = g_files[c.file];
-      const char* base = fm.data;
-      const char* fe = base + fm.size;
-      const char* p = base + c.beg;
-      if (c.beg == 0) {
-        const char* nl = (const char*)memchr(p, '\n', fm.size);
-        p = nl ? nl + 1 : fe;
-      } else if (base[c.beg - 1] != '\n') {
-        const char* nl = (const char*)memchr(p, '\n', (size_t)(fe - p));
-        p = nl ? nl + 1 : fe;
-      }
-      const char* cend = base + c.end;
-      if (p < cend) {
-        if (fm.kind == 0)
-          parse_events(tid, p, cend, fe);
-        else if (fm.kind == 1)
-          parse_clicks(tid, p, cend, fe);
-        else
-          parse_links(tid, p, cend, fe);
-      }
-      if (fm.kind == 2 && links_left.fetch_sub(1) == 1) run_union_find();
+      process_chunk(tid, chunks[ci], vb);
+      if (g_files[chunks[ci].file].kind == 2 && links_left.fetch_sub(1) == 1) run_union_find();
     }
   });
   logt("parse");
