@@ -1422,6 +1422,29 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     e.cnt = 0;
   }
   S.ev.resize(n);
+#ifdef SESS_PERSORT
+  for (size_t k = 0; k < n; k++) {
+    PEnt& e = S.ents[S.eidx[k]];
+    S.ev[e.off + e.cnt++] = (S.tk[k] & 0xFFFFFFFF00000000ULL) | S.pcs[k];
+  }
+  for (auto& e : S.ents) {
+    u64* ev = S.ev.data() + e.off;
+    u32 m = e.cnt;
+    if (m < 2) continue;
+    if (m < 24) {
+      for (u32 i = 1; i < m; i++) {
+        u64 x = ev[i];
+        u32 j = i;
+        while (j > 0 && ev[j - 1] > x) {
+          ev[j] = ev[j - 1];
+          j--;
+        }
+        ev[j] = x;
+      }
+    } else
+      std::sort(ev, ev + m);
+  }
+#else
   radix_hi32(S.tk.data(), n, S.tmp);
   for (size_t i = 0; i < n; i++) {
     u64 x = S.tk[i];
@@ -1429,6 +1452,7 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     PEnt& e = S.ents[S.eidx[k]];
     S.ev[e.off + e.cnt++] = (x & 0xFFFFFFFF00000000ULL) | S.pcs[k];
   }
+#endif
   // clicks
   size_t nc = 0;
   for (int t = 0; t < NT; t++) nc += g_cper.count(t, q);
