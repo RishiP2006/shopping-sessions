@@ -443,7 +443,12 @@ struct Fld {
 };
 
 static inline void masks64(const char* p, u64& c, u64& q, u64& nl) {
-#if defined(__AVX2__)
+#if defined(__AVX512BW__) && !defined(NO_AVX512_MASKS)
+  __m512i v = _mm512_loadu_si512((const void*)p);
+  c = (u64)_mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(','));
+  q = (u64)_mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8('"'));
+  nl = (u64)_mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8('\n'));
+#elif defined(__AVX2__)
   __m256i a = _mm256_loadu_si256((const __m256i*)p);
   __m256i b = _mm256_loadu_si256((const __m256i*)(p + 32));
   __m256i C = _mm256_set1_epi8(','), Q = _mm256_set1_epi8('"'), N = _mm256_set1_epi8('\n');
@@ -679,11 +684,188 @@ static inline u32 tz128(u128 x) {
 }
 static inline u32 pop128(u128 x) { return (u32)(__builtin_popcountll((u64)x) + __builtin_popcountll((u64)(x >> 64))); }
 
+static inline u64 pext64(u64 x, u64 m) {
+#if defined(__BMI2__)
+  return _pext_u64(x, m);
+#else
+  u64 r = 0;
+  for (u32 k = 0; m; k++, m &= m - 1)
+    if (x & m & (~m + 1)) r |= 1ULL << k;
+  return r;
+#endif
+}
+
+// Delimiter-ordinal scanner. Every comma and newline is structural (values never hold
+// them), so each 64-byte block is classified once and its delimiters are flattened into
+// small rings; lines are then cut with a fixed number of ring reads.
+// Quotes are validated per block with bit algebra: a quote is legal only with a delimiter
+// on exactly one side, and the field after delimiter i starts with a quote exactly when
+// the field before delimiter i+1 ends with one (pext over the delimiter mask). A block
+// that fails marks itself dirty and its lines go through tok_scalar, so the result is
+// exact either way. Same contract as scan_old.
+template <int N, class F>
+static const char* scan_ord(const char* p, const char* cend, const char* fend, bool eof, F&& fn) {
+  const size_t len = (size_t)(fend - p);
+  if (len == 0) return fend;
+  const u32 cend_off = cend >= fend ? (u32)len + 1 : (u32)(cend - p);
+  constexpr u64 CM = 4095, NM = 1023;
+  constexpr int NFL = N >= 7 ? 2 : (N >= 4 ? 3 : 6);  // unconditional newline writes per block
+  static thread_local u32 CR[4096], NR[1024];
+  static thread_local std::vector<u64> dirty;
+  const size_t nb = (len + 63) >> 6;
+  dirty.assign((nb >> 6) + 2, 0);
+  const bool virt = eof && p[len - 1] != '\n';  // final line without newline
+  u64 ch = 0, ct = 0, nh = 0, nt = 0;
+  u32 ls = 0;
+  bool line_overflow = false;
+  u64 pD = ~0ULL, pQ = 0, kD = 0, kQ = 0, ocarry = 0;
+  size_t kb = 0;
+  bool pending = false;
+  Fld f[N];
+  auto finalize = [&](u64 nD0, u64 nQ0) {
+    u64 Lm = (kD << 1) | (pD >> 63);
+    u64 Rm = (kD >> 1) | (nD0 << 63);
+    u64 bad = kQ & ~(Lm ^ Rm);
+    u32 cnt = (u32)__builtin_popcountll(kD);
+    u64 mism;
+    if (LIKELY((kQ | (pQ >> 63) | nQ0) == 0)) {
+      mism = cnt ? ocarry : 0;
+      if (cnt) ocarry = 0;
+    } else {
+      u64 qa = (kQ >> 1) | (nQ0 << 63), qb = (kQ << 1) | (pQ >> 63);
+      u64 ob = pext64(qa & kD, kD), cb = pext64(qb & kD, kD);
+      u64 lowm = cnt >= 64 ? ~0ULL : ((1ULL << cnt) - 1);
+      mism = (cb ^ ((ob << 1) | ocarry)) & lowm;
+      if (cnt) ocarry = (ob >> (cnt - 1)) & 1;
+    }
+    if (UNLIKELY(bad | mism)) dirty[kb >> 6] |= 1ULL << (kb & 63);
+    pD = kD;
+    pQ = kQ;
+  };
+  // Consume complete lines whose newline offset is < lim. Returns false at the chunk end.
+  auto consume = [&](u64 lim) -> bool {
+    while (nh < nt) {
+      u32 nl = NR[nh & NM];
+      if (nl >= lim) break;
+      if (UNLIKELY(ls >= cend_off)) return false;
+      nh++;
+      const u32 l0 = ls;
+      ls = nl + 1;
+      bool ok = !line_overflow && ct - ch >= (u64)(N - 1) && CR[(ch + N - 2) & CM] < nl &&
+                (ch + N - 1 == ct || CR[(ch + N - 1) & CM] > nl);
+      if (UNLIKELY(!ok)) {
+        line_overflow = false;
+        while (ch < ct && CR[ch & CM] < nl) ch++;
+        continue;
+      }
+      u32 st = l0;
+      for (int i = 0; i < N - 1; i++) {
+        u32 e = CR[(ch + i) & CM];
+        f[i].p = p + st;
+        f[i].n = e - st;
+        st = e + 1;
+      }
+      f[N - 1].p = p + st;
+      f[N - 1].n = nl - st;
+      ch += N - 1;
+      size_t b0 = l0 >> 6, b1 = nl >> 6;
+      u64 dl;
+      if (LIKELY((b0 >> 6) == (b1 >> 6)))
+        dl = dirty[b0 >> 6] & ((~0ULL << (b0 & 63)) & ((~0ULL) >> (63 - (b1 & 63))));
+      else {
+        dl = 0;
+        for (size_t b = b0; b <= b1; b++) dl |= (dirty[b >> 6] >> (b & 63)) & 1;
+      }
+      if (UNLIKELY(dl)) {
+        if (tok_scalar<N>(p + l0, p + nl, f)) fn(f);
+        continue;
+      }
+      for (int i = 0; i < N; i++) {
+        u32 isq = (u32)(f[i].n >= 2) & (u32)(f[i].p[0] == '"');
+        f[i].p += isq;
+        f[i].n -= 2 * isq;
+      }
+      fn(f);
+    }
+    return true;
+  };
+  for (size_t b = 0; b < nb;) {
+    const size_t bend = std::min(nb, b + 8);
+    for (; b < bend; b++) {
+      u64 C, Q, NL;
+      masks64(p + (b << 6), C, Q, NL);
+      const size_t rem = len - (b << 6);
+      if (rem < 64) {
+        u64 vm = (1ULL << rem) - 1;
+        C &= vm;
+        Q &= vm;
+        NL &= vm;
+        if (virt) NL |= 1ULL << rem;
+      }
+      const u64 D = C | NL;
+      if (b == 0) ocarry = Q & 1;
+      if (pending) finalize(D & 1, Q & 1);
+      kD = D;
+      kQ = Q;
+      kb = b;
+      pending = true;
+      const u32 base = (u32)(b << 6);
+      {
+        u32 cc = (u32)__builtin_popcountll(C);
+        u64 m = C;
+        for (int i = 0; i < 8; i++) {
+          CR[(ct + i) & CM] = base + tz64(m);
+          m &= m - 1;
+        }
+        for (u32 i = 8; i < cc; i++) {
+          CR[(ct + i) & CM] = base + (u32)__builtin_ctzll(m);
+          m &= m - 1;
+        }
+        ct += cc;
+      }
+      {
+        u32 nc = (u32)__builtin_popcountll(NL);
+        u64 m = NL;
+        for (int i = 0; i < NFL; i++) {
+          NR[(nt + i) & NM] = base + tz64(m);
+          m &= m - 1;
+        }
+        for (u32 i = NFL; i < nc; i++) {
+          NR[(nt + i) & NM] = base + (u32)__builtin_ctzll(m);
+          m &= m - 1;
+        }
+        nt += nc;
+      }
+    }
+    if (!consume((u64)kb << 6)) return p + ls;
+    if (UNLIKELY(nh == nt && ct - ch > 2048)) {  // one unterminated line with too many commas
+      line_overflow = true;
+      ch = ct;
+    }
+  }
+  if (virt && (len & 63) == 0) {
+    finalize(1, 0);
+    NR[nt & NM] = (u32)len;
+    nt++;
+    kD = 1;
+    kQ = 0;
+    kb = nb;
+    finalize(0, 0);
+  } else if (pending)
+    finalize(0, 0);
+  if (!consume(~0ULL)) return p + ls;
+  if (eof) return fend;
+  return p + ls;
+}
+
 // Two-stage scanner: stage 1 computes comma/quote/newline masks for every 64-byte block
 // of [p, fend); stage 2 cuts lines branch-free from a 3-block window of those masks.
 // Same contract as scan_old.
 template <int N, class F>
 static const char* scan(const char* p, const char* cend, const char* fend, bool eof, F&& fn) {
+#ifdef ORD_SCAN
+  return scan_ord<N>(p, cend, fend, eof, fn);
+#endif
 #if !defined(OLD_SCAN) && !defined(NEW_SCAN)
   return scan_line<N>(p, cend, fend, eof, fn);
 #endif

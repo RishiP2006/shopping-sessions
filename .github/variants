@@ -1,2 +1,4 @@
-baseline e34a706 --
 current HEAD --
+ord HEAD -- -DORD_SCAN
+cur512 HEAD -- -mavx512f -mavx512bw -mavx512vl
+ord512 HEAD -- -DORD_SCAN -mavx512f -mavx512bw -mavx512vl

@@ -36,6 +36,7 @@ jobs:
           [ -f .github/variants ] || echo "new HEAD --" > .github/variants
           while read -r name ref rest; do
             [ -z "$name" ] && continue
+            case $name in *512*) grep -q avx512bw /proc/cpuinfo || { echo "skip $name (no avx512bw)"; continue; };; esac
             envs="${rest%%--*}"; flags="${rest#*--}"
             mkdir -p /tmp/v/$name
             if [ "$ref" = HEAD ]; then cp src/pipeline.cpp src/parquet.hpp /tmp/v/$name/; else
@@ -48,6 +49,10 @@ jobs:
         run: |
           g++ -O1 -g -march=haswell -std=c++17 -pthread -fsanitize=address,undefined -o /tmp/scanner tools/check_scanner.cpp
           ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 /tmp/scanner
+          g++ -O1 -g -march=haswell -std=c++17 -pthread -fsanitize=address,undefined -DORD_SCAN -o /tmp/scanner_ord tools/check_scanner.cpp
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 /tmp/scanner_ord
+          g++ -O1 -g -march=haswell -std=c++17 -pthread -fsanitize=address,undefined -DORD_SCAN -o /tmp/edge_ord tools/check_ord_edges.cpp
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 /tmp/edge_ord
       - name: Correctness
         run: |
           python3 scripts/run_fixtures.py fixtures -- /tmp/pipeline | tail -1

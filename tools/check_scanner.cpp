@@ -34,7 +34,7 @@ static void check(const std::string& input, size_t cut, bool eof) {
     if (tok_scalar<N>(expected_end, nl ? nl : end, f)) collect(expected, f);
     expected_end = nl ? nl + 1 : end;
   }
-  const char* actual_end = scan_line<N>(begin, limit, end, eof, [&](Fld* f) { collect(actual, f); });
+  const char* actual_end = scan<N>(begin, limit, end, eof, [&](Fld* f) { collect(actual, f); });
   if (actual != expected || actual_end != expected_end) {
     fprintf(stderr, "scanner mismatch: N=%d length=%zu cut=%zu eof=%d expected-end=%td actual-end=%td\n",
             N, input.size(), cut, eof, expected_end - begin, actual_end - begin);
