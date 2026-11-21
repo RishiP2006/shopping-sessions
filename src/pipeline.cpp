@@ -1315,7 +1315,7 @@ struct SessScratch {
   std::vector<u64> ev;
   std::vector<u32> cidx;
   std::vector<ClickE> cl;
-  std::vector<u32> ccnt, cpos, clist;
+  std::vector<u32> ccnt, cpos, clist, center;
   std::vector<i64> catsum;
   std::vector<u32> cattouch;
   std::vector<u64> tmp;
@@ -1529,6 +1529,7 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
   if (S.ccnt.size() < ncamp) {
     S.ccnt.assign(ncamp, 0);
     S.cpos.assign(ncamp, 0);
+    S.center.assign(ncamp, 0);
   }
   if (S.catsum.size() < g_cats.size()) S.catsum.assign(g_cats.size(), 0);
   const size_t NC = g_camp_id.size();
@@ -1560,6 +1561,18 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     u32 lo = 0, hi = 0;
     S.clist.clear();
     i32 cur_day = -1;
+    // assists: a campaign in the click window assists every session counted while it is
+    // there; credit it lazily when it leaves the window or the day changes.
+    u32 cnt_day = 0;
+    u32* cen = S.center.data();
+    auto flush_assists = [&]() {
+      if (cur_day < 0) return;
+      u32* ad = aa + (size_t)cur_day * NC;
+      for (u32 c : S.clist) {
+        ad[c] += cnt_day - cen[c];
+        cen[c] = 0;
+      }
+    };
     i64 d_sess = 0, d_ev = 0, d_rev = 0;
     S.cattouch.clear();
     auto flush_day = [&]() {
@@ -1587,7 +1600,9 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
       i32 day = (i32)((dayoff + (i64)s) / DAYMS);
       if (day != cur_day) {
         flush_day();
+        flush_assists();
         cur_day = day;
+        cnt_day = 0;
       }
       u32 j = i;
       while (j < m) {
@@ -1613,12 +1628,15 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
         if (S.ccnt[c]++ == 0) {
           S.cpos[c] = (u32)S.clist.size();
           S.clist.push_back(c);
+          cen[c] = cnt_day;
         }
         hi++;
       }
       while (lo < hi && cl[lo].ts < s) {
         u32 c = cl[lo].camp;
         if (--S.ccnt[c] == 0) {
+          aa[(size_t)cur_day * NC + c] += cnt_day - cen[c];
+          cen[c] = 0;
           u32 pos = S.cpos[c];
           u32 last = S.clist.back();
           S.clist[pos] = last;
@@ -1638,11 +1656,11 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
       as[di + credited]++;
       ap[di + credited] += purch;
       ar[di + credited] += rev;
-      u32* ad = aa + di;
-      for (u32 c : S.clist) ad[c]++;
+      cnt_day++;
       i = j;
     }
     flush_day();
+    flush_assists();
     for (u32 c : S.clist) S.ccnt[c] = 0;
     S.clist.clear();
   }
