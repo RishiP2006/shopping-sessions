@@ -53,6 +53,7 @@ jobs:
         run: |
           docker build -q -t shopping-sessions:latest . > /dev/null
           docker images shopping-sessions:latest --format "image size {{.Size}}"
+          export CPUS=4 MEM=12g PLATFORM=linux/amd64
           python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh | tail -1
           rm -rf /tmp/od && scripts/docker_run.sh /tmp/dev /tmp/od 2>/dev/null
           (cd scripts && python3 compare.py /tmp/od /tmp/ans/dev-answer | tail -1)
