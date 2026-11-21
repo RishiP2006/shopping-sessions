@@ -942,6 +942,7 @@ static std::vector<std::string> g_cats;
 static u32 g_unknown_cat;
 static std::vector<std::string> g_camp_id, g_camp_ch;
 static LinkTab g_links;
+static size_t g_rows_reserve = 0;
 static thread_local u64 g_exp_sink = 0;
 
 struct FileMap {
@@ -1674,64 +1675,71 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
 
 // ---------------------------------------------------------------- output
 static void write_user_file(const std::string& path, std::vector<UserRow>& rows) {
-  std::vector<pq::Column> cols(6);
-  cols[0] = {"user_id", pq::BYTE_ARRAY, pq::L_STRING, false, {}, {}};
-  cols[1] = {"day", pq::INT32, pq::L_DATE, false, {}, {}};
-  cols[2] = {"sessions", pq::INT64, pq::L_NONE, false, {}, {}};
-  cols[3] = {"events", pq::INT64, pq::L_NONE, false, {}, {}};
-  cols[4] = {"revenue_cents", pq::INT64, pq::L_NONE, false, {}, {}};
-  cols[5] = {"top_category", pq::BYTE_ARRAY, pq::L_STRING, true, {}, {}};
   size_t n = rows.size();
+  size_t name_bound = 0, cat_bytes = 0;
+  for (auto& r : rows) {
+    name_bound += 4 + ((r.name & LONGBIT) ? g_istr[(u32)(r.name & 0xffffffffu)].size() : 9);
+    if (r.topcat != UINT32_MAX) {
+      cat_bytes += 4 + g_cats[r.topcat].size();
+    }
+  }
+  // one uninitialised buffer for every column
+  size_t total = name_bound + n * (4 + 4 + 4 + 8) + cat_bytes + n / 4 + 64;
+  char* buf = (char*)malloc(total + 64);
+  char* o = buf;
+  char* c_name = o;
+  for (auto& r : rows) {
+    u32 len = decode_fast(r.name, o + 4);
+    memcpy(o, &len, 4);
+    o += 4 + len;
+  }
+  size_t l_name = (size_t)(o - c_name);
+  char* c_day = o;
+  char* c_ses = c_day + 4 * n;
+  char* c_evs = c_ses + 4 * n;
+  char* c_rev = c_evs + 4 * n;
+  char* c_cat = c_rev + 8 * n;
   {
-    std::string& s = cols[0].values;
-    size_t bound = 0;
-    for (auto& r : rows) bound += 4 + ((r.name & LONGBIT) ? g_istr[(u32)(r.name & 0xffffffffu)].size() : 9);
-    s.resize(bound);
-    char* o = &s[0];
-    for (auto& r : rows) {
-      u32 len = decode_fast(r.name, o + 4);
+    i32* d = (i32*)c_day;
+    i32* se = (i32*)c_ses;
+    i32* ev = (i32*)c_evs;
+    i64* rv = (i64*)c_rev;
+    for (size_t i = 0; i < n; i++) {
+      const UserRow& r = rows[i];
+      d[i] = r.day;
+      se[i] = (i32)r.sessions;
+      ev[i] = (i32)r.events;
+      rv[i] = r.rev;
+    }
+  }
+  o = c_cat;
+  pq::DefLevels dl;
+  for (auto& r : rows) {
+    if (r.topcat == UINT32_MAX)
+      dl.add(0);
+    else {
+      dl.add(1);
+      const std::string& c = g_cats[r.topcat];
+      u32 len = (u32)c.size();
       memcpy(o, &len, 4);
+      memcpy(o + 4, c.data(), len);
       o += 4 + len;
     }
-    s.resize((size_t)(o - &s[0]));
   }
-  {
-    std::string& s = cols[1].values;
-    s.resize(n * 4);
-    char* o = &s[0];
-    for (auto& r : rows) {
-      memcpy(o, &r.day, 4);
-      o += 4;
-    }
-  }
-  for (int c = 0; c < 3; c++) {
-    std::string& s = cols[2 + c].values;
-    s.resize(n * 8);
-    char* o = &s[0];
-    for (auto& r : rows) {
-      i64 v = c == 0 ? r.sessions : c == 1 ? r.events : r.rev;
-      memcpy(o, &v, 8);
-      o += 8;
-    }
-  }
-  {
-    pq::DefLevels dl;
-    std::string& s = cols[5].values;
-    for (auto& r : rows) {
-      if (r.topcat == UINT32_MAX)
-        dl.add(0);
-      else {
-        dl.add(1);
-        const std::string& c = g_cats[r.topcat];
-        pq::put_str(s, c.data(), (u32)c.size());
-      }
-    }
-    cols[5].deflev = dl.finish();
-  }
-  if (!pq::write_file(path, (int64_t)n, cols)) {
+  std::string def = dl.finish();
+  std::vector<pq::RawColumn> cols = {
+      {"user_id", pq::BYTE_ARRAY, pq::L_STRING, false, c_name, l_name, nullptr, 0},
+      {"day", pq::INT32, pq::L_DATE, false, c_day, 4 * n, nullptr, 0},
+      {"sessions", pq::INT32, pq::L_NONE, false, c_ses, 4 * n, nullptr, 0},
+      {"events", pq::INT32, pq::L_NONE, false, c_evs, 4 * n, nullptr, 0},
+      {"revenue_cents", pq::INT64, pq::L_NONE, false, c_rev, 8 * n, nullptr, 0},
+      {"top_category", pq::BYTE_ARRAY, pq::L_STRING, true, c_cat, (size_t)(o - c_cat), def.data(), def.size()},
+  };
+  if (!pq::write_raw(path, (int64_t)n, cols)) {
     fprintf(stderr, "failed to write %s\n", path.c_str());
     exit(1);
   }
+  free(buf);
 }
 
 static void write_campaign_file(const std::string& path, const std::vector<CD>& cd) {
@@ -1984,6 +1992,7 @@ int main() {
   while ((1ull << P2BITS) * (u64)P2_TARGET < ev_est && P2BITS < 13) P2BITS++;
   P2 = 1 << P2BITS;
   g_links.init(link_bytes / 10 + 1024);
+  g_rows_reserve = ev_est / 6 / (size_t)NT + 4096;
   size_t cap_per = ev_est / ((size_t)NT * P);
   size_t cap1 = ev_est / ((size_t)NT * P1);
   cap1 = cap1 + cap1 / 16 + 32;
@@ -2109,6 +2118,7 @@ int main() {
       me.a_purch.assign(ncd, 0);
       me.a_assist.assign(ncd, 0);
       me.a_rev.assign(ncd, 0);
+      me.rows.reserve(g_rows_reserve);
       {
         SessScratch S;
         while (true) {

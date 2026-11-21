@@ -175,6 +175,109 @@ inline bool write_file(const std::string& path, int64_t nrows, std::vector<Colum
   return fclose(f) == 0;
 }
 
+// Raw-buffer column (no copies): values/def levels point to caller memory.
+struct RawColumn {
+  std::string name;
+  int ptype;
+  int logical;
+  bool optional;
+  const char* vals;
+  size_t vlen;
+  const char* def;  // 4-byte length prefix + RLE data, optional columns only
+  size_t dlen;
+};
+
+inline bool write_raw(const std::string& path, int64_t nrows, const std::vector<RawColumn>& cols) {
+  FILE* f = fopen(path.c_str(), "wb");
+  if (!f) return false;
+  setvbuf(f, nullptr, _IONBF, 0);
+  fwrite("PAR1", 1, 4, f);
+  int64_t off = 4;
+  struct Meta { int64_t page_off, total; };
+  std::vector<Meta> metas;
+  for (auto& c : cols) {
+    if (nrows == 0) break;
+    Thrift t;
+    int64_t body = (int64_t)c.vlen + (int64_t)(c.optional ? c.dlen : 0);
+    t.i32(1, 0);
+    t.i32(2, (int32_t)body);
+    t.i32(3, (int32_t)body);
+    t.sbegin(5);
+    t.i32(1, (int32_t)nrows);
+    t.i32(2, 0);
+    t.i32(3, 3);
+    t.i32(4, 3);
+    t.send();
+    t.byte(0);
+    fwrite(t.b.data(), 1, t.b.size(), f);
+    if (c.optional) fwrite(c.def, 1, c.dlen, f);
+    fwrite(c.vals, 1, c.vlen, f);
+    int64_t total = (int64_t)t.b.size() + body;
+    metas.push_back({off, total});
+    off += total;
+  }
+  Thrift m;
+  m.i32(1, 1);
+  m.lbegin(2, 12, (int)cols.size() + 1);
+  m.ebegin();
+  m.bin(4, "schema");
+  m.i32(5, (int32_t)cols.size());
+  m.eend();
+  for (auto& c : cols) {
+    m.ebegin();
+    m.i32(1, c.ptype);
+    m.i32(3, c.optional ? 1 : 0);
+    m.bin(4, c.name);
+    if (c.logical == L_STRING) m.i32(6, 0);
+    if (c.logical == L_DATE) m.i32(6, 6);
+    if (c.logical != L_NONE) {
+      m.sbegin(10);
+      m.sbegin(c.logical);
+      m.send();
+      m.send();
+    }
+    m.eend();
+  }
+  m.i64(3, nrows);
+  int64_t total_bytes = 0;
+  for (auto& x : metas) total_bytes += x.total;
+  if (nrows > 0) {
+    m.lbegin(4, 12, 1);
+    m.ebegin();
+    m.lbegin(1, 12, (int)cols.size());
+    for (size_t i = 0; i < cols.size(); i++) {
+      m.ebegin();
+      m.i64(2, metas[i].page_off);
+      m.sbegin(3);
+      m.i32(1, cols[i].ptype);
+      m.lbegin(2, 5, 2);
+      m.li32(0);
+      m.li32(3);
+      m.lbegin(3, 8, 1);
+      m.lbin(cols[i].name);
+      m.i32(4, 0);
+      m.i64(5, nrows);
+      m.i64(6, metas[i].total);
+      m.i64(7, metas[i].total);
+      m.i64(9, metas[i].page_off);
+      m.send();
+      m.eend();
+    }
+    m.i64(2, total_bytes);
+    m.i64(3, nrows);
+    m.eend();
+  } else {
+    m.lbegin(4, 12, 0);
+  }
+  m.bin(6, "shopping-sessions-native");
+  m.byte(0);
+  fwrite(m.b.data(), 1, m.b.size(), f);
+  uint32_t ml = (uint32_t)m.b.size();
+  fwrite(&ml, 1, 4, f);
+  fwrite("PAR1", 1, 4, f);
+  return fclose(f) == 0;
+}
+
 inline void put_i32(std::string& s, int32_t v) { s.append((const char*)&v, 4); }
 inline void put_i64(std::string& s, int64_t v) { s.append((const char*)&v, 8); }
 inline void put_str(std::string& s, const char* p, uint32_t n) {
