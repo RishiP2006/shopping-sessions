@@ -81,7 +81,7 @@ static std::mutex g_imu;
 static std::unordered_map<std::string, u32> g_imap;
 static std::deque<std::string> g_istr;
 
-static u64 intern_slow(const char* p, u32 n) {
+__attribute__((noinline)) static u64 intern_slow(const char* p, u32 n) {
   std::lock_guard<std::mutex> lk(g_imu);
   std::string s(p, n);
   auto it = g_imap.find(s);
@@ -93,7 +93,7 @@ static u64 intern_slow(const char* p, u32 n) {
 }
 
 // p[0..15] must be readable.
-static inline u64 pack7(const char* p, u32 n) {
+__attribute__((always_inline)) static inline u64 pack7(const char* p, u32 n) {
   if (LIKELY(n - 1 < 9)) {
     u64 w;
     memcpy(&w, p, 8);
@@ -158,7 +158,7 @@ static void decode(u64 code, std::string& out) {
   out.assign(buf, n);
 }
 
-static bool key_less(u64 a, u64 b) {
+__attribute__((noinline)) static bool key_less(u64 a, u64 b) {
   if (!((a | b) & LONGBIT)) return a < b;
   std::string x, y;
   decode(a, x);
@@ -193,7 +193,7 @@ static void init_dates() {
 
 // "YYYY-MM-DDTHH:MM:SS" followed by c-word check; returns ms without zone
 template <u32 CMASK, u32 CVAL>
-static inline bool civil_core(const char* p, i64& out) {
+__attribute__((always_inline)) static inline bool civil_core(const char* p, i64& out) {
   u64 a, b;
   u32 c;
   memcpy(&a, p, 8);
@@ -232,7 +232,7 @@ static inline bool civil_core(const char* p, i64& out) {
 }
 
 // p[0..n+15] readable
-static inline bool parse_ts(const char* p, u32 n, i64& out) {
+__attribute__((always_inline)) static inline bool parse_ts(const char* p, u32 n, i64& out) {
   if (n == 20) {
     if (p[4] == '-') return civil_core<0xFF0000FFu, 0x5A00003Au>(p, out);
   } else if (n == 25) {
@@ -250,6 +250,28 @@ static inline bool parse_ts(const char* p, u32 n, i64& out) {
     return true;
   }
 digits:
+  if (LIKELY(n - 9 < 8)) {  // 9..16 chars: SWAR
+    u32 k = n - 8;           // 1..8 leading chars
+    u64 w, lo;
+    memcpy(&w, p, 8);
+    memcpy(&lo, p + k, 8);
+    w <<= 8 * (8 - k);
+    w |= 0x3030303030303030ULL & ((~0ULL) >> (8 * k));
+    const u64 Z = 0x3030303030303030ULL;
+    u64 xa = w ^ Z, xb = lo ^ Z;
+    if ((((xa | xb) & 0xF0F0F0F0F0F0F0F0ULL) | (((xa + 0x0606060606060606ULL) | (xb + 0x0606060606060606ULL)) &
+                                                 0x1010101010101010ULL)) == 0) {
+      auto conv = [](u64 v) -> u64 {
+        v = (v * 10 + (v >> 8)) & 0x00FF00FF00FF00FFULL;
+        v = (v * 100 + (v >> 16)) & 0x0000FFFF0000FFFFULL;
+        v = (v * 10000 + (v >> 32)) & 0x00000000FFFFFFFFULL;
+        return v;
+      };
+      out = (i64)(conv(xa) * 100000000ULL + conv(xb));
+      return true;
+    }
+    return false;
+  }
   if (n == 0) return false;
   u32 i = 0;
   while (i < n && p[i] == '0') i++;
@@ -593,7 +615,7 @@ struct PartBuf {
   std::vector<std::vector<size_t>> extra;
   static size_t total_for(size_t cap_per, int nth, int parts) {
     size_t m = cap_per * nth * parts;
-    return m + m / 2 + (size_t)nth * parts * CH + CH;
+    return m + m / 2 + (size_t)nth * parts * CH * 2 + CH;
   }
   void init(size_t cap_per, int nth, int parts, void* mem = nullptr, size_t mem_n = 0) {
     cap = cap_per;
@@ -986,7 +1008,7 @@ static void radix_sort_ts(u64* a, size_t n, std::vector<u64>& tmp) {
   if (src != a) memcpy(a, src, n * sizeof(u64));
 }
 
-static inline bool click_less(const ClickE& a, const ClickE& b) {
+__attribute__((always_inline)) static inline bool click_less(const ClickE& a, const ClickE& b) {
   if (a.ts != b.ts) return a.ts < b.ts;
   if (!((a.cid | b.cid) & LONGBIT)) return a.cid < b.cid;
   return key_less(a.cid, b.cid);
@@ -997,11 +1019,6 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
   size_t n = 0;
   for (int t = 0; t < NT; t++) n += g_rec2.count(t, q);
   if (!n) return;
-  S.in.resize(n);
-  {
-    size_t k = 0;
-    for (int t = 0; t < NT; t++) g_rec2.each(t, q, [&](const Rec2& x) { S.in[k++] = x; });
-  }
   size_t cap = 64;
   int lg = 6;
   while (cap < n / 4) { cap <<= 1; lg++; }
@@ -1022,8 +1039,9 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
       S.tab[i] = e + 1;
     }
   };
-  for (size_t k = 0; k < n; k++) {
-    const Rec2& r = S.in[k];
+  size_t k0 = 0;
+  for (int t = 0; t < NT; t++) g_rec2.each(t, q, [&](const Rec2& r) {
+    size_t k = k0++;
     u64 i = hmix(r.person, K3) >> sh;
     u32 e;
     while (true) {
@@ -1043,7 +1061,7 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     }
     S.ents[e].cnt++;
     S.eidx[k] = e;
-  }
+  });
   u32 off = 0;
   for (auto& e : S.ents) {
     e.off = off;
@@ -1051,9 +1069,13 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     e.cnt = 0;
   }
   S.ev.resize(n);
-  for (size_t k = 0; k < n; k++) {
-    PEnt& e = S.ents[S.eidx[k]];
-    S.ev[e.off + e.cnt++] = ((u64)S.in[k].ts << 32) | S.in[k].pc;
+  {
+    size_t k = 0;
+    for (int t = 0; t < NT; t++)
+      g_rec2.each(t, q, [&](const Rec2& r) {
+        PEnt& e = S.ents[S.eidx[k++]];
+        S.ev[e.off + e.cnt++] = ((u64)r.ts << 32) | r.pc;
+      });
   }
   // clicks
   size_t nc = 0;
@@ -1124,7 +1146,7 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     ClickE* cl = S.cl.data() + e.coff;
     u32 kc = e.ccnt;
     if (kc > 1) {
-      std::sort(cl, cl + kc, click_less);
+      std::sort(cl, cl + kc, [](const ClickE& a, const ClickE& b) { return click_less(a, b); });
       u32 w = 1;
       for (u32 i = 1; i < kc; i++)
         if (cl[i].cid != cl[w - 1].cid) cl[w++] = cl[i];
@@ -1471,13 +1493,13 @@ int main() {
   P = 1 << PBITS;
   g_links.init(link_bytes / 10 + 1024);
   size_t cap_per = ev_est / ((size_t)NT * P);
-  cap_per = cap_per + cap_per / 4 + 64;
+  cap_per = cap_per + cap_per / 16 + 32;
   g_keys.init(cap_per, NT, P);
   g_pay.init(cap_per, NT, P);
   g_loser = (std::atomic<u64>*)big_alloc((g_pay.total_n / 64 + 1) * sizeof(u64));
   size_t click_est = click_bytes / 44 + 1024;
   size_t ccap = click_est / ((size_t)NT * P);
-  ccap = ccap + ccap / 4 + 16;
+  ccap = ccap + ccap / 16 + 16;
   g_craw.init(ccap, NT, P);
   g_cper.init(ccap, NT, P);
   logt("setup");
