@@ -985,24 +985,51 @@ struct SessScratch {
   std::vector<i64> catsum;
   std::vector<u32> cattouch;
   std::vector<u64> tmp;
+  std::vector<u64> tk;
+  std::vector<u32> pcs;
+  std::vector<ClickE> cin;
 };
 
-static void radix_sort_ts(u64* a, size_t n, std::vector<u64>& tmp) {
-  tmp.resize(n);
+// Sort u64 keys by their top 32 bits (stable), LSD radix with 11-bit digits.
+static void radix_hi32(u64* a, size_t n, std::vector<u64>& tmp) {
+  if (n < 64) {
+    for (size_t i = 1; i < n; i++) {
+      u64 x = a[i];
+      size_t j = i;
+      while (j > 0 && (a[j - 1] >> 32) > (x >> 32)) {
+        a[j] = a[j - 1];
+        j--;
+      }
+      a[j] = x;
+    }
+    return;
+  }
+  if (tmp.size() < n) tmp.resize(n);
+  static thread_local u32 cnt[3][2048];
+  memset(cnt, 0, sizeof cnt);
+  for (size_t i = 0; i < n; i++) {
+    u64 x = a[i];
+    cnt[0][(x >> 32) & 2047]++;
+    cnt[1][(x >> 43) & 2047]++;
+    cnt[2][(x >> 54) & 1023]++;
+  }
   u64* src = a;
   u64* dst = tmp.data();
   for (int pass = 0; pass < 3; pass++) {
+    u32* c = cnt[pass];
     int sh = 32 + pass * 11;
-    size_t cnt[2048];
-    memset(cnt, 0, sizeof cnt);
-    for (size_t i = 0; i < n; i++) cnt[(src[i] >> sh) & 2047]++;
-    size_t s = 0;
-    for (int b = 0; b < 2048; b++) {
-      size_t c = cnt[b];
-      cnt[b] = s;
-      s += c;
+    u32 nb = pass == 2 ? 1024 : 2048;
+    if (c[(src[0] >> sh) & (nb - 1)] == n) continue;  // all in one bucket: already ordered on this digit
+    u32 s0 = 0;
+    for (u32 b = 0; b < nb; b++) {
+      u32 x = c[b];
+      c[b] = s0;
+      s0 += x;
     }
-    for (size_t i = 0; i < n; i++) dst[cnt[(src[i] >> sh) & 2047]++] = src[i];
+    for (size_t i = 0; i < n; i++) {
+      u64 x = src[i];
+      dst[c[(x >> sh) & (nb - 1)]++] = x;
+    }
     std::swap(src, dst);
   }
   if (src != a) memcpy(a, src, n * sizeof(u64));
@@ -1025,6 +1052,8 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
   S.tab.assign(cap, 0);
   S.ents.clear();
   S.eidx.resize(n);
+  S.tk.resize(n);
+  S.pcs.resize(n);
   u64 mask = cap - 1;
   int sh = 64 - lg;
   auto rehash = [&]() {
@@ -1061,6 +1090,8 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     }
     S.ents[e].cnt++;
     S.eidx[k] = e;
+    S.tk[k] = ((u64)r.ts << 32) | (u64)k;
+    S.pcs[k] = r.pc;
   });
   u32 off = 0;
   for (auto& e : S.ents) {
@@ -1069,18 +1100,19 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     e.cnt = 0;
   }
   S.ev.resize(n);
-  {
-    size_t k = 0;
-    for (int t = 0; t < NT; t++)
-      g_rec2.each(t, q, [&](const Rec2& r) {
-        PEnt& e = S.ents[S.eidx[k++]];
-        S.ev[e.off + e.cnt++] = ((u64)r.ts << 32) | r.pc;
-      });
+  radix_hi32(S.tk.data(), n, S.tmp);
+  for (size_t i = 0; i < n; i++) {
+    u64 x = S.tk[i];
+    u32 k = (u32)x;
+    PEnt& e = S.ents[S.eidx[k]];
+    S.ev[e.off + e.cnt++] = (x & 0xFFFFFFFF00000000ULL) | S.pcs[k];
   }
   // clicks
   size_t nc = 0;
   for (int t = 0; t < NT; t++) nc += g_cper.count(t, q);
   S.cidx.resize(nc);
+  S.cin.resize(nc);
+  if (S.tk.size() < nc) S.tk.resize(nc);
   size_t k = 0;
   for (int t = 0; t < NT; t++)
     g_cper.each(t, q, [&](const ClickRec& c) {
@@ -1095,8 +1127,13 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
         }
         i = (i + 1) & mask;
       }
-      S.cidx[k++] = e;
-      if (e != UINT32_MAX) S.ents[e].ccnt++;
+      if (e != UINT32_MAX) {
+        S.ents[e].ccnt++;
+        S.cidx[k] = e;
+        S.cin[k] = {c.ts, c.camp, c.cid};
+        S.tk[k] = ((u64)c.ts << 32) | (u64)k;
+        k++;
+      }
     });
   off = 0;
   for (auto& e : S.ents) {
@@ -1105,14 +1142,15 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     e.ccnt = 0;
   }
   S.cl.resize(off);
-  k = 0;
-  for (int t = 0; t < NT; t++)
-    g_cper.each(t, q, [&](const ClickRec& c) {
-      u32 ei = S.cidx[k++];
-      if (ei == UINT32_MAX) return;
-      PEnt& e = S.ents[ei];
-      S.cl[e.coff + e.ccnt++] = {c.ts, c.camp, c.cid};
-    });
+  {
+    size_t m = k;
+    radix_hi32(S.tk.data(), m, S.tmp);
+    for (size_t i = 0; i < m; i++) {
+      u32 kk = (u32)S.tk[i];
+      PEnt& e = S.ents[S.cidx[kk]];
+      S.cl[e.coff + e.ccnt++] = S.cin[kk];
+    }
+  }
 
   const u32 ncamp = (u32)g_camp_id.size();
   if (S.ccnt.size() < ncamp) {
@@ -1127,29 +1165,19 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
   for (auto& e : S.ents) {
     u64* ev = S.ev.data() + e.off;
     u32 m = e.cnt;
-    if (m > 1) {
-      if (m < 24) {
-        for (u32 i = 1; i < m; i++) {
-          u64 x = ev[i];
-          u32 j = i;
-          while (j > 0 && ev[j - 1] > x) {
-            ev[j] = ev[j - 1];
-            j--;
-          }
-          ev[j] = x;
-        }
-      } else if (m < 20000)
-        std::sort(ev, ev + m);
-      else
-        radix_sort_ts(ev, m, S.tmp);
-    }
     ClickE* cl = S.cl.data() + e.coff;
     u32 kc = e.ccnt;
     if (kc > 1) {
-      std::sort(cl, cl + kc, [](const ClickE& a, const ClickE& b) { return click_less(a, b); });
-      u32 w = 1;
-      for (u32 i = 1; i < kc; i++)
-        if (cl[i].cid != cl[w - 1].cid) cl[w++] = cl[i];
+      // sorted by ts; order equal-ts runs by click_id and drop duplicate copies
+      u32 w = 0;
+      for (u32 i = 0; i < kc;) {
+        u32 j = i + 1;
+        while (j < kc && cl[j].ts == cl[i].ts) j++;
+        if (j - i > 1) std::sort(cl + i, cl + j, [](const ClickE& a, const ClickE& b) { return click_less(a, b); });
+        for (u32 x = i; x < j; x++)
+          if (x == i || cl[x].cid != cl[x - 1].cid) cl[w++] = cl[x];
+        i = j;
+      }
       kc = w;
     }
     u32 lo = 0, hi = 0;

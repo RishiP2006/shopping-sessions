@@ -55,3 +55,5 @@ jobs:
           rm -rf /tmp/o
           DATA_DIR=/tmp/p20 OUTPUT_DIR=/tmp/o NCPU=4 perf record -F 2000 -o /tmp/perf.data /tmp/pipeline_g 2>/dev/null >/dev/null
           perf report -i /tmp/perf.data --no-children --sort symbol --stdio 2>/dev/null | grep -E "^ +[0-9]" | cut -c1-110 | head -30
+          echo "== SRCLINE"
+          perf report -i /tmp/perf.data --no-children --sort srcline --stdio 2>/dev/null | grep -E "^ +[0-9]" | cut -c1-110 | head -70
