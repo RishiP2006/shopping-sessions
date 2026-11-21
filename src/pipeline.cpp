@@ -776,9 +776,24 @@ struct UserRow {
   i64 sessions, events, rev;
 };
 
+#ifdef USE_WC
 static WCBuf<EKey> g_keys;   // by event_id
 static WCBuf<EPay> g_pay;    // by user (same hash bits as the link table)
 static WCBuf<Rec2> g_rec2;   // by person (reuses g_keys memory)
+#else
+template <class T>
+struct PlainBuf : PartBuf<T> {
+  inline u32 put(int t, u32 p, const T& x) {
+    T* w = this->slot(t, p);
+    *w = x;
+    return this->ref(w);
+  }
+  void finish(int) {}
+};
+static PlainBuf<EKey> g_keys;
+static PlainBuf<EPay> g_pay;
+static PlainBuf<Rec2> g_rec2;
+#endif
 static PartBuf<ClickRec> g_craw;  // valid clicks by user
 static PartBuf<ClickRec> g_cper;  // valid clicks by person
 static std::atomic<u64>* g_loser = nullptr;
@@ -1572,7 +1587,10 @@ int main() {
   }
   size_t ev_est = ev_bytes / 74 + 1024;
   PBITS = 4;
-  while ((1ull << PBITS) * 65536ull < ev_est && PBITS < 12) PBITS++;
+  #ifndef PART_TARGET
+#define PART_TARGET 65536
+#endif
+  while ((1ull << PBITS) * (u64)PART_TARGET < ev_est && PBITS < 12) PBITS++;
   P = 1 << PBITS;
   g_links.init(link_bytes / 10 + 1024);
   size_t cap_per = ev_est / ((size_t)NT * P);
