@@ -776,6 +776,14 @@ struct EPay {  // valid copy payload
   u32 ts;  // ms since window_start
   u32 pc;  // price | cat << 24 (purchase), 0 otherwise
 };
+struct EFull {  // SINGLE mode: whole event copy, partitioned by event_id
+  u64 eid;
+  u64 user;
+  u32 ts;
+  i32 ing;
+  u32 pc;
+  u32 valid;
+};
 struct Rec2 {  // surviving event, partitioned by person
   u64 person;
   u32 ts;
@@ -985,6 +993,7 @@ static PlainBuf<EKey> g_keys;
 static PlainBuf<EPay> g_pay;
 static PlainBuf<Rec2> g_rec2;
 #endif
+static PartBuf<EFull> g_full;  // SINGLE mode
 static PartBuf<ClickRec> g_craw;  // valid clicks by user
 static PartBuf<ClickRec> g_cper;  // valid clicks by person
 static std::atomic<u64>* g_loser = nullptr;
@@ -1160,6 +1169,10 @@ static const char* parse_events(int tid, const char* p, const char* cend, const 
         pc = price | (cat << 24);
       }
       u64 user = pack7(f[1].p, f[1].n);
+#ifdef SINGLE
+      g_full.push(tid, p1_of(k.eid), EFull{k.eid, user, (u32)ts, k.ing, pc, 1});
+      return;
+#endif
 #ifdef PARSE_LOOKUP
       push_pend(tid, tl, Pend{user, k.eid, k.ing, (u32)ts, pc});
       return;
@@ -1172,6 +1185,10 @@ static const char* parse_events(int tid, const char* p, const char* cend, const 
     } while (0);
 #ifdef EXP_NOSCATTER
     g_exp_sink += k.eid + k.ing + k.ref;
+    return;
+#endif
+#ifdef SINGLE
+    g_full.push(tid, p1_of(k.eid), EFull{k.eid, 0, 0, k.ing, 0, 0});
     return;
 #endif
     g_keys.put(tid, p1_of(k.eid), k);
@@ -1231,6 +1248,71 @@ static inline void mark_loser(u32 ref) {
   if (ref != NOREF) g_loser[ref >> 6].fetch_or(1ULL << (ref & 63), std::memory_order_relaxed);
 }
 
+#ifdef SINGLE
+struct DedupScratch1 {
+  std::vector<EFull> a;
+  std::vector<u32> tab;
+  std::vector<u32> win;
+};
+static void dedup_single(int tid, u32 p, DedupScratch1& S) {
+  STEP_BEGIN
+  size_t n = 0;
+  for (int t = 0; t < NT; t++) n += g_full.count(t, p);
+  if (!n) return;
+  S.a.resize(n);
+  size_t k = 0;
+  for (int t = 0; t < NT; t++) g_full.each(t, p, [&](const EFull& x) { S.a[k++] = x; });
+  STEP(5)
+  size_t cap = 16;
+  int lg = 4;
+  while (cap < n + n / 2) { cap <<= 1; lg++; }
+  if (S.tab.size() < cap) S.tab.resize(cap);
+  u32* tab = S.tab.data();
+  memset(tab, 0, cap * sizeof(u32));
+  u64 mask = cap - 1;
+  int sh = 64 - lg;
+  const EFull* A = S.a.data();
+  S.win.clear();
+  bool dup = false;
+  for (u32 i = 0; i < n; i++) {
+    const EFull& x = A[i];
+    u64 h = hmix(x.eid, K3) >> sh;
+    while (true) {
+      u32 t = tab[h];
+      if (!t) {
+        tab[h] = i + 1;
+        break;
+      }
+      const EFull& w = A[t - 1];
+      if (w.eid == x.eid) {
+        dup = true;
+        if (x.ing < w.ing) tab[h] = i + 1;
+        break;
+      }
+      h = (h + 1) & mask;
+    }
+  }
+  if (!dup) {
+    for (u32 i = 0; i < n; i++)
+      if (A[i].valid) S.win.push_back(i);
+  } else {
+    for (size_t i = 0; i < cap; i++)
+      if (tab[i] && A[tab[i] - 1].valid) S.win.push_back(tab[i] - 1);
+  }
+  STEP(6)
+  const size_t D = 16, m = S.win.size();
+  const u32* W = S.win.data();
+  for (size_t i = 0; i < m && i < D; i++) g_links.prefetch(A[W[i]].user);
+  for (size_t i = 0; i < m; i++) {
+    if (i + D < m) g_links.prefetch(A[W[i + D]].user);
+    const EFull& r = A[W[i]];
+    u64 person = g_links.lookup(r.user);
+    g_rec2.put(tid, p2_of(person), Rec2{person, r.ts, r.pc});
+  }
+  STEP(7)
+}
+#endif
+
 static void dedup_partition(int tid, u32 p, DedupScratch& S) {
   STEP_BEGIN
   size_t n = 0;
@@ -1278,7 +1360,7 @@ static void map_partition(int tid, u32 u) {
   const u64* lw = (const u64*)g_loser;
   (void)lw;
   for (int t = 0; t < NT; t++) {
-#ifndef PARSE_LOOKUP
+#if !defined(PARSE_LOOKUP) && !defined(SINGLE)
     g_pay.runs(t, u, [&](const EPay* a, const EPay* b) {
       u32 r = g_pay.ref(a);
       for (; a != b; a++, r++) {
@@ -1999,11 +2081,16 @@ int main() {
   size_t cap2 = ev_est / ((size_t)NT * P2);
   cap2 = cap2 + cap2 / 16 + 32;
   cap_per = cap_per + cap_per / 16 + 32;
+#ifdef SINGLE
+  g_full.init(cap1, NT, P1);
+  g_rec2.init(cap2, NT, P2);
+  g_loser = (std::atomic<u64>*)big_alloc(64);
+#elif defined(PARSE_LOOKUP)
   g_keys.init(cap1, NT, P1);
-#ifdef PARSE_LOOKUP
   g_rec2.init(cap2, NT, P2);
   g_loser = (std::atomic<u64>*)big_alloc((g_rec2.total_n / 64 + 1) * sizeof(u64));
 #else
+  g_keys.init(cap1, NT, P1);
   g_pay.init(cap_per, NT, P);
   g_loser = (std::atomic<u64>*)big_alloc((g_pay.total_n / 64 + 1) * sizeof(u64));
 #endif
@@ -2065,18 +2152,28 @@ int main() {
   {
     std::atomic<u32> nx{0};
     parallel(NT, [&](int tid) {
+#ifdef SINGLE
+      DedupScratch1 S;
+      while (true) {
+        u32 p = nx.fetch_add(1);
+        if (p >= (u32)P1) break;
+        dedup_single(tid, p, S);
+      }
+      g_rec2.finish(tid);
+#else
       DedupScratch S;
       while (true) {
         u32 p = nx.fetch_add(1);
         if (p >= (u32)P1) break;
         dedup_partition(tid, p, S);
       }
+#endif
     });
   }
   logt("dedup");
   // phase 2b: map persons, scatter by person
   {
-#ifndef PARSE_LOOKUP
+#if !defined(PARSE_LOOKUP) && !defined(SINGLE)
     if (PartBuf<Rec2>::total_for(cap2, NT, P2) <= g_keys.total_n)
       g_rec2.init(cap2, NT, P2, g_keys.base, g_keys.total_n);  // keys are dead: reuse their memory
     else
