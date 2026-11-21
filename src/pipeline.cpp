@@ -1849,6 +1849,7 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
 #ifdef EXP_WALK_NOCLICK
     kc = 0;
 #endif
+    #ifndef CLICK_STREAM
     if (kc > 1) {
       // sorted by ts; order equal-ts runs by click_id and drop duplicate copies
       u32 w = 0;
@@ -1862,7 +1863,11 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
       }
       kc = w;
     }
+    #endif
     u32 lo = 0, hi = 0;
+#ifdef CLICK_STREAM
+    u32 latest = 0;
+#endif
     S.clist.clear();
     i32 cur_day = -1;
     // assists: a campaign in the click window assists every session counted while it is
@@ -1930,6 +1935,11 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
       d_rev += rev;
       u64 sc = (u64)s + (u64)WEEKMS;
       while (hi < kc && cl[hi].ts <= sc) {
+#ifdef CLICK_STREAM
+        // Duplicate copies enter and leave at the same instant. They change the
+        // multiplicity, never campaign presence, so no separate dedup/sort is needed.
+        if (hi == 0 || cl[hi].ts != cl[latest].ts || key_less(cl[hi].cid, cl[latest].cid)) latest = hi;
+#endif
         u32 c = cl[hi].camp;
         if (S.ccnt[c]++ == 0) {
           S.cpos[c] = (u32)S.clist.size();
@@ -1953,10 +1963,14 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
       }
       u32 credited = 0;
       if (hi > lo) {
+#ifdef CLICK_STREAM
+        credited = cl[latest].camp;
+#else
         u32 jj = hi - 1;
         u32 t = cl[jj].ts;
         while (jj > lo && cl[jj - 1].ts == t) jj--;
         credited = cl[jj].camp;
+#endif
       }
       size_t di = (size_t)day * NC;
       as[di + credited]++;
@@ -2000,16 +2014,15 @@ static void write_user_file(const std::string& path, std::vector<UserRow>& rows)
   char* c_rev = c_evs + 4 * n;
   char* c_cat = c_rev + 8 * n;
   {
-    i32* d = (i32*)c_day;
-    i32* se = (i32*)c_ses;
-    i32* ev = (i32*)c_evs;
-    i64* rv = (i64*)c_rev;
+    // String column sizes need not align the following numeric columns.
+    // memcpy emits unaligned stores without undefined typed-pointer accesses.
     for (size_t i = 0; i < n; i++) {
       const UserRow& r = rows[i];
-      d[i] = r.day;
-      se[i] = (i32)r.sessions;
-      ev[i] = (i32)r.events;
-      rv[i] = r.rev;
+      i32 se = (i32)r.sessions, ev = (i32)r.events;
+      memcpy(c_day + 4 * i, &r.day, 4);
+      memcpy(c_ses + 4 * i, &se, 4);
+      memcpy(c_evs + 4 * i, &ev, 4);
+      memcpy(c_rev + 8 * i, &r.rev, 8);
     }
   }
   o = c_cat;
@@ -2479,5 +2492,6 @@ int main() {
   }
 #endif
   fflush(stderr);
+  if (getenv("SS_PROFILE")) return 0;  // allow GCC to flush build-time PGO counters
   _exit(0);
 }

@@ -37,9 +37,16 @@ jobs:
           while read -r name ref rest; do
             [ -z "$name" ] && continue
             envs="${rest%%--*}"; flags="${rest#*--}"
+            if [[ "$name" == *avx512* ]] && ! grep -q avx512bw /proc/cpuinfo; then echo "SKIP $name: CPU lacks AVX-512"; continue; fi
             mkdir -p /tmp/v/$name
             if [ "$ref" = HEAD ]; then cp src/pipeline.cpp src/parquet.hpp /tmp/v/$name/; else
               git show $ref:src/pipeline.cpp > /tmp/v/$name/pipeline.cpp; git show $ref:src/parquet.hpp > /tmp/v/$name/parquet.hpp; fi
+            if [[ "$name" == pgo* ]]; then
+              g++ -O3 -march=haswell -mtune=skylake-avx512 -std=c++17 -static -pthread $flags -fprofile-generate=/tmp/v/$name/profile -fprofile-update=atomic -o /tmp/v/$name/bin /tmp/v/$name/pipeline.cpp
+              rm -rf /tmp/pgo-out
+              SS_PROFILE=1 DATA_DIR=/tmp/dev OUTPUT_DIR=/tmp/pgo-out NCPU=4 /tmp/v/$name/bin 2>/dev/null
+              flags="$flags -fprofile-use=/tmp/v/$name/profile -fprofile-correction"
+            fi
             g++ -O3 -march=haswell -mtune=skylake-avx512 -std=c++17 -static -pthread $flags -o /tmp/v/$name/bin /tmp/v/$name/pipeline.cpp
             echo "$envs" > /tmp/v/$name/env
             echo "variant $name ref=$ref env=[$envs] flags=[$flags]"
