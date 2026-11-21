@@ -61,9 +61,10 @@ jobs:
               echo >> /tmp/res_$v
             done
           done
-          echo "== SUMMARY (median wall, median per-phase end times)"
+          echo "== SUMMARY median wall"
           for v in $names; do
-            printf "%-12s %s\n" $v "$(grep -o '[0-9.]* wall' /tmp/res_$v | sort -n | sed -n 3p)"
+            m=$(grep -o '[0-9.]* wall' /tmp/res_$v | sort -n | sed -n 3p || true)
+            echo "SUM $v $m"
           done
       - name: Profile
         continue-on-error: true

@@ -427,6 +427,9 @@ static const char* scan(const char* p, const char* cend, const char* fend, bool 
     const char* line = ls;
     ls += L + 1;
     if (UNLIKELY((u32)(__builtin_popcountll(clo) + __builtin_popcountll(chi)) != (u32)(N - 1))) continue;
+    const u64 clo0 = clo, chi0 = chi;
+    (void)clo0;
+    (void)chi0;
     u32 st = 0;
     for (int i = 0; i < N - 1; i++) {
       u32 e = ctz2(clo, chi);
@@ -437,6 +440,31 @@ static const char* scan(const char* p, const char* cend, const char* fend, bool 
     }
     f[N - 1].p = line + st;
     f[N - 1].n = L - st;
+#ifdef QMASK
+    if (qlo | qhi) {
+      typedef unsigned __int128 u128;
+      u128 Cm = (u128)clo0 | ((u128)chi0 << 64);
+      u128 Qm = (u128)qlo | ((u128)qhi << 64);
+      u128 one = 1;
+      u128 lm = (one << L) - 1;
+      u128 SEP = Cm | (one << L);
+      u128 FS = ((Cm << 1) | one) & lm;
+      u128 FE = SEP >> 1;
+      u128 QS = Qm & FS, QE = Qm & FE;
+      u128 M = ~SEP & lm;
+      if (UNLIKELY(Qm != (QS | QE) || QE != (((M + QS) & SEP) >> 1) || (QS & QE))) continue;
+      while (QS) {
+        u64 lo = (u64)QS, hi = (u64)(QS >> 64);
+        u32 sp = ctz2(lo, hi);
+        u128 below = (one << sp) - 1;
+        u128 cb = Cm & below;
+        u32 idx = (u32)(__builtin_popcountll((u64)cb) + __builtin_popcountll((u64)(cb >> 64)));
+        f[idx].p++;
+        f[idx].n -= 2;
+        QS &= QS - 1;
+      }
+    }
+#else
     if (qlo | qhi) {
       u32 qc = (u32)(__builtin_popcountll(qlo) + __builtin_popcountll(qhi));
       u32 pairs = 0;
@@ -451,6 +479,7 @@ static const char* scan(const char* p, const char* cend, const char* fend, bool 
       }
       if (pairs * 2 != qc) continue;
     }
+#endif
     fn(f);
   }
   return ls < fend ? ls : fend;
@@ -754,9 +783,11 @@ static std::vector<std::string> g_cats;
 static u32 g_unknown_cat;
 static std::vector<std::string> g_camp_id, g_camp_ch;
 static LinkTab g_links;
+static thread_local u64 g_exp_sink = 0;
 
 struct FileMap {
   int fd;
+  const char* map;
   size_t size;
   int kind;  // 0 events, 1 clicks, 2 links
 };
@@ -840,7 +871,19 @@ static void open_file(const std::string& path, int kind) {
     close(fd);
     return;
   }
-  g_files.push_back({fd, n, kind});
+  const char* mp = nullptr;
+#ifdef USE_MMAP
+  size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+  size_t total = (n + pg - 1) / pg * pg + (64 << 10);
+  void* res = mmap(nullptr, total, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void* m = mmap(res, n, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
+  if (res == MAP_FAILED || m == MAP_FAILED) {
+    fprintf(stderr, "mmap failed\n");
+    exit(1);
+  }
+  mp = (const char*)m;
+#endif
+  g_files.push_back({fd, mp, n, kind});
 }
 
 template <int N, class F>
@@ -882,6 +925,11 @@ static inline u32 pu_of(u64 user) { return (u32)(hmix(user, K4) >> (64 - PBITS))
 static const char* parse_events(int tid, const char* p, const char* cend, const char* fend, bool eof) {
   const i64 wlen = WE - WS;
   return scan<7>(p, cend, fend, eof, [&](Fld* f) {
+#ifdef EXP_SCANONLY
+    g_tl[tid].rows.reserve(0);
+    g_exp_sink += f[0].n + f[6].n;
+    return;
+#endif
     if (UNLIKELY(f[0].n == 0)) return;
     EKey k;
     k.eid = pack7(f[0].p, f[0].n);
@@ -916,8 +964,16 @@ static const char* parse_events(int tid, const char* p, const char* cend, const 
         pc = price | (cat << 24);
       }
       u64 user = pack7(f[1].p, f[1].n);
+#ifdef EXP_NOSCATTER
+      k.ref = (u32)(user ^ ts ^ pc);
+#else
       k.ref = g_pay.put(tid, pu_of(user), EPay{user, (u32)ts, pc});
+#endif
     } while (0);
+#ifdef EXP_NOSCATTER
+    g_exp_sink += k.eid + k.ing + k.ref;
+    return;
+#endif
     g_keys.put(tid, p1_of(k.eid), k);
   });
 }
@@ -1437,6 +1493,27 @@ static size_t RDBUF = 256 << 10;
 // that starts inside it.
 static void process_chunk(int tid, const Chunk& c, std::vector<char>& vb) {
   const FileMap& fi = g_files[c.file];
+#ifdef USE_MMAP
+  {
+    (void)vb;
+    const char* base = fi.map;
+    const char* fe = base + fi.size;
+    const char* p = base + c.beg;
+    if (c.beg == 0) {
+      const char* nl = (const char*)memchr(p, '\n', fi.size);
+      p = nl ? nl + 1 : fe;
+    } else if (base[c.beg - 1] != '\n') {
+      const char* nl = (const char*)memchr(p, '\n', (size_t)(fe - p));
+      p = nl ? nl + 1 : fe;
+    }
+    const char* cend = base + c.end;
+    if (p >= cend) return;
+    if (fi.kind == 0) parse_events(tid, p, cend, fe, true);
+    else if (fi.kind == 1) parse_clicks(tid, p, cend, fe, true);
+    else parse_links(tid, p, cend, fe, true);
+    return;
+  }
+#endif
   size_t cap = vb.size() - 512;
   char* buf = vb.data();
   size_t boff = c.beg == 0 ? 0 : c.beg - 1;  // file offset of buf[0]
