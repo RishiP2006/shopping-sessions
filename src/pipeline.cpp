@@ -1000,6 +1000,9 @@ struct alignas(64) TL {
   std::vector<u32> fresh;
   std::vector<UserRow> rows;
   std::vector<CD> cd;
+  // day-major per-thread accumulators: index day * ncamp + camp
+  std::vector<u32> a_sess, a_purch, a_assist;
+  std::vector<i64> a_rev;
 };
 static std::vector<TL> g_tl;
 
@@ -1528,7 +1531,11 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     S.cpos.assign(ncamp, 0);
   }
   if (S.catsum.size() < g_cats.size()) S.catsum.assign(g_cats.size(), 0);
-  CD* cd = me.cd.data();
+  const size_t NC = g_camp_id.size();
+  u32* as = me.a_sess.data();
+  u32* ap = me.a_purch.data();
+  u32* aa = me.a_assist.data();
+  i64* ar = me.a_rev.data();
   const int ND = NDAYS;
   const i64 dayoff = WS - DAY0 * DAYMS;
 
@@ -1627,11 +1634,12 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
         while (jj > lo && cl[jj - 1].ts == t) jj--;
         credited = cl[jj].camp;
       }
-      CD& x = cd[(size_t)credited * ND + day];
-      x.sessions++;
-      x.purch += purch;
-      x.rev += rev;
-      for (u32 c : S.clist) cd[(size_t)c * ND + day].assisted++;
+      size_t di = (size_t)day * NC;
+      as[di + credited]++;
+      ap[di + credited] += purch;
+      ar[di + credited] += rev;
+      u32* ad = aa + di;
+      for (u32 c : S.clist) ad[c]++;
       i = j;
     }
     flush_day();
@@ -2073,7 +2081,11 @@ int main() {
     std::atomic<size_t> total_rows{0};
     parallel(NT, [&](int tid) {
       TL& me = g_tl[tid];
-      me.cd.assign(g_camp_id.size() * (size_t)NDAYS, CD{0, 0, 0, 0});
+      size_t ncd = g_camp_id.size() * (size_t)NDAYS;
+      me.a_sess.assign(ncd, 0);
+      me.a_purch.assign(ncd, 0);
+      me.a_assist.assign(ncd, 0);
+      me.a_rev.assign(ncd, 0);
       {
         SessScratch S;
         while (true) {
@@ -2089,13 +2101,17 @@ int main() {
       if (finished.fetch_add(1, std::memory_order_acq_rel) == NT - 1) {
         if (total_rows.load() == 0) write_user_file(UD + nm, me.rows);
         std::vector<CD> total(g_camp_id.size() * (size_t)NDAYS, CD{0, 0, 0, 0});
+        const size_t NCm = g_camp_id.size();
         for (auto& tl : g_tl)
-          for (size_t i = 0; i < total.size(); i++) {
-            total[i].sessions += tl.cd[i].sessions;
-            total[i].purch += tl.cd[i].purch;
-            total[i].rev += tl.cd[i].rev;
-            total[i].assisted += tl.cd[i].assisted;
-          }
+          for (int d = 0; d < NDAYS; d++)
+            for (size_t c = 0; c < NCm; c++) {
+              size_t j = (size_t)d * NCm + c;
+              CD& t = total[c * NDAYS + d];
+              t.sessions += tl.a_sess[j];
+              t.purch += tl.a_purch[j];
+              t.rev += tl.a_rev[j];
+              t.assisted += tl.a_assist[j];
+            }
         write_campaign_file(CDD + "/part-00000.parquet", total);
       }
     });
