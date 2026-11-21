@@ -1,5 +1,8 @@
 baseline e34a706 --
-ingest HEAD -- -DFAST_INGEST
-line HEAD -- -DLINE_SCAN
-line_ingest HEAD -- -DLINE_SCAN -DFAST_INGEST
-line_ingest_lto HEAD -- -DLINE_SCAN -DFAST_INGEST -flto
+line_ingest 048371e -- -DLINE_SCAN -DFAST_INGEST
+date HEAD -- -DLINE_SCAN -DFAST_INGEST -DDAY_CACHE
+index HEAD -- -DINDEX_SCAN -DFAST_INGEST
+simd HEAD -- -DLINE_SCAN -DFAST_INGEST -DSIMD_DATE
+wide HEAD -- -DLINE_SCAN -DFAST_INGEST -march=native
+wide_date HEAD -- -DLINE_SCAN -DFAST_INGEST -DDAY_CACHE -march=native
+wide_index HEAD -- -DINDEX_SCAN -DFAST_INGEST -march=native

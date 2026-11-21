@@ -206,6 +206,57 @@ static void init_dates() {
     }
 }
 
+struct DateEntry {
+  u64 prefix;
+  u32 tail;
+  i32 day;
+};
+static DateEntry g_date_cache[256];
+
+static void init_window_dates(i64 ws, i64 we) {
+  const i64 first = ws / DAYMS - 8, last = we / DAYMS + 1;
+  for (u32 y = 0; y < TYN; y++) for (u32 m = 1; m <= 12; m++) {
+    u32 k = y * 12 + m - 1;
+    i64 d0 = g_mstart[k];
+    if (d0 > last || d0 + g_mdim[k] <= first) continue;
+    for (u32 d = 1; d <= g_mdim[k]; d++) {
+      i64 day = d0 + d - 1;
+      if (day < first || day > last) continue;
+      char b[32] = {};
+      snprintf(b, sizeof b, "%04u-%02u-%02uT", y + TY0, m, d);
+      u64 prefix; u32 tail;
+      memcpy(&prefix, b, 8);
+      memcpy(&tail, b + 8, 4);
+      tail &= 0x00FFFFFFu;
+      g_date_cache[(d / 10) * 16 + d % 10] = {prefix, tail, (i32)day};
+    }
+  }
+}
+
+// A directly indexed cache of dates in this manifest's window. Every hit compares
+// all ten date bytes and 'T', so impossible dates and non-ASCII digits cannot hit.
+// Colliding days of month and dates outside the cache retain the full decoder.
+template <bool ZULU>
+__attribute__((always_inline)) static inline bool cached_day(const char* p, i64& out) {
+  u64 a, b; u32 c;
+  memcpy(&a, p, 8); memcpy(&b, p + 8, 8); memcpy(&c, p + 16, 4);
+  u32 ix = ((u32)b & 15) * 16 + (((u32)b >> 8) & 15);
+  const DateEntry& e = g_date_cache[ix];
+  if (UNLIKELY(e.prefix != a || e.tail != ((u32)b & 0x00FFFFFFu))) return false;
+  if (UNLIKELY((b & 0x0000FF0000000000ULL) != 0x00003A0000000000ULL ||
+               (c & (ZULU ? 0xFF0000FFu : 0xFFu)) != (ZULU ? 0x5A00003Au : 0x3Au))) return false;
+  u64 db = (b ^ 0x3030303030303030ULL) & 0xFFFF00FFFF000000ULL;
+  u32 dc = (c ^ 0x30303030u) & 0x00FFFF00u;
+  if (UNLIKELY((db & 0xF0F0F0F0F0F0F0F0ULL) | (dc & 0xF0F0F0F0u) |
+      ((db + 0x0606060606060606ULL) & 0x1010101010101010ULL) | ((dc + 0x06060606u) & 0x10101010u))) return false;
+  u32 h = (u32)((db >> 24) & 255) * 10 + (u32)((db >> 32) & 255);
+  u32 mi = (u32)((db >> 48) & 255) * 10 + (u32)(db >> 56);
+  u32 sec = ((dc >> 8) & 255) * 10 + ((dc >> 16) & 255);
+  if (UNLIKELY(h > 23 || mi > 59 || sec > 59)) return false;
+  out = ((i64)e.day * 86400 + h * 3600 + mi * 60 + sec) * 1000;
+  return true;
+}
+
 // "YYYY-MM-DDTHH:MM:SS" followed by c-word check; returns ms without zone
 template <u32 CMASK, u32 CVAL>
 __attribute__((always_inline)) static inline bool civil_core(const char* p, i64& out) {
@@ -217,6 +268,20 @@ __attribute__((always_inline)) static inline bool civil_core(const char* p, i64&
   if ((a & 0xFF0000FF00000000ULL) != 0x2D00002D00000000ULL) return false;
   if ((b & 0x0000FF0000FF0000ULL) != 0x00003A0000540000ULL) return false;
   if ((c & CMASK) != CVAL) return false;
+#if defined(SIMD_DATE) && defined(__AVX2__)
+  __m128i x = _mm_loadu_si128((const __m128i*)p);
+  __m128i t = _mm_cvtsi32_si128((int)c);
+  __m128i d = _mm_or_si128(
+      _mm_shuffle_epi8(x, _mm_setr_epi8(0,1,2,3,5,6,8,9,11,12,14,15,-1,-1,-1,-1)),
+      _mm_shuffle_epi8(t, _mm_setr_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,1,2,-1,-1)));
+  d = _mm_xor_si128(d, _mm_setr_epi8(48,48,48,48,48,48,48,48,48,48,48,48,48,48,0,0));
+  if (UNLIKELY(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) != 65535)) return false;
+  __m128i pairs = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010A));
+  u32 yr = (u32)_mm_cvtsi128_si32(pairs), md = (u32)_mm_extract_epi32(pairs, 1);
+  u32 hm = (u32)_mm_extract_epi32(pairs, 2);
+  u32 Y = (yr & 65535) * 100 + (yr >> 16), M = md & 65535, D = md >> 16;
+  u32 h = hm & 65535, mi = hm >> 16, s = (u32)_mm_extract_epi16(pairs, 6);
+#else
   const u64 Z = 0x3030303030303030ULL;
   u64 da = (a ^ Z) & 0x00FFFF00FFFFFFFFULL, db = (b ^ Z) & 0xFFFF00FFFF00FFFFULL;
   u32 dc = (c ^ 0x30303030u) & 0x00FFFF00u;
@@ -232,6 +297,7 @@ __attribute__((always_inline)) static inline bool civil_core(const char* p, i64&
   u32 mi = BY(db, 6) * 10 + BY(db, 7);
   u32 s = BY(dc, 1) * 10 + BY(dc, 2);
 #undef BY
+#endif
   if (M - 1 > 11 || h > 23 || mi > 59 || s > 59 || D == 0) return false;
   i64 days;
   if (LIKELY(Y - TY0 < TYN)) {
@@ -249,6 +315,10 @@ __attribute__((always_inline)) static inline bool civil_core(const char* p, i64&
 // ingest_ts is guaranteed to be valid F1 by the input contract.
 // Decode it without repeating the checks required for dirty event/click timestamps.
 __attribute__((always_inline)) static inline i64 parse_ingest(const char* p) {
+#ifdef DAY_CACHE
+  i64 out;
+  if (cached_day<true>(p, out)) return out;
+#endif
   u32 y = (u32)(p[0] - '0') * 1000 + (u32)(p[1] - '0') * 100 + (u32)(p[2] - '0') * 10 + (u32)(p[3] - '0');
   u32 m = (u32)(p[5] - '0') * 10 + (u32)(p[6] - '0');
   u32 d = (u32)(p[8] - '0') * 10 + (u32)(p[9] - '0');
@@ -268,6 +338,9 @@ struct HourEnt {
 static thread_local HourEnt g_hc[1024];
 template <bool ZULU>
 __attribute__((always_inline)) static inline bool civil_cached(const char* p, i64& out) {
+#ifdef DAY_CACHE
+  if (cached_day<ZULU>(p, out)) return true;
+#endif
 #ifdef HOURCACHE
   u64 a, b, t;
   memcpy(&a, p, 8);
@@ -383,7 +456,12 @@ struct Fld {
 };
 
 static inline void masks64(const char* p, u64& c, u64& q, u64& nl) {
-#if defined(__AVX2__)
+#if defined(__AVX512BW__)
+  __m512i a = _mm512_loadu_si512((const void*)p);
+  c = _mm512_cmpeq_epi8_mask(a, _mm512_set1_epi8(','));
+  q = _mm512_cmpeq_epi8_mask(a, _mm512_set1_epi8('"'));
+  nl = _mm512_cmpeq_epi8_mask(a, _mm512_set1_epi8('\n'));
+#elif defined(__AVX2__)
   __m256i a = _mm256_loadu_si256((const __m256i*)p);
   __m256i b = _mm256_loadu_si256((const __m256i*)(p + 32));
   __m256i C = _mm256_set1_epi8(','), Q = _mm256_set1_epi8('"'), N = _mm256_set1_epi8('\n');
@@ -619,11 +697,76 @@ static inline u32 tz128(u128 x) {
 }
 static inline u32 pop128(u128 x) { return (u32)(__builtin_popcountll((u64)x) + __builtin_popcountll((u64)(x >> 64))); }
 
+// Materialize separators once, then tokenize fixed-width rows with direct offsets.
+// Quotes are counted across the whole row and checked against its field endpoints.
+template <int N, class F>
+static const char* scan_index(const char* p, const char* cend, const char* fend, bool eof, F&& fn) {
+  struct Sep { u32 off, quotes; };
+  static thread_local std::vector<Sep> seps;
+  const size_t len = (size_t)(fend - p);
+  if (len >= 0x80000000ULL) return scan_old<N>(p, cend, fend, eof, fn);
+  seps.clear();
+  if (seps.capacity() < len / 4 + 32) seps.reserve(len / 4 + 32);
+  u32 quotes = 0;
+  for (size_t b = 0; b < len; b += 64) {
+    u64 c, q, nl;
+    masks64(p + b, c, q, nl);
+    if (UNLIKELY(len - b < 64)) {
+      u64 mask = (1ULL << (len - b)) - 1;
+      c &= mask; q &= mask; nl &= mask;
+    }
+    u64 sep = c | nl;
+    while (sep) {
+      u32 bit = (u32)__builtin_ctzll(sep);
+      u32 off = (u32)b + bit;
+      off |= (u32)((nl >> bit) & 1) << 31;
+      seps.push_back({off, quotes + (u32)__builtin_popcountll(q & ((1ULL << bit) - 1))});
+      sep &= sep - 1;
+    }
+    quotes += (u32)__builtin_popcountll(q);
+  }
+  if (eof && len && p[len - 1] != '\n') seps.push_back({(u32)len | 0x80000000u, quotes});
+  size_t ix = 0;
+  u32 start = 0, oldq = 0;
+  Fld f[N];
+  while (ix < seps.size() && p + start < cend) {
+    if (UNLIKELY(seps.size() - ix < N)) break;
+    u32 bad = 0;
+    for (int i = 0; i < N - 1; i++) bad |= seps[ix + i].off;
+    if (UNLIKELY((bad >> 31) || !(seps[ix + N - 1].off >> 31))) {
+      while (ix < seps.size() && !(seps[ix].off >> 31)) ix++;
+      if (ix == seps.size()) break;
+      start = (seps[ix].off & 0x7FFFFFFFu) + 1;
+      oldq = seps[ix++].quotes;
+      continue;
+    }
+    u32 st = start, pairs = 0;
+    for (int i = 0; i < N; i++) {
+      u32 end = seps[ix + i].off & 0x7FFFFFFFu;
+      u32 n = end - st;
+      u32 quoted = (u32)(n >= 2) & (u32)(p[st] == '"') & (u32)(p[end ? end - 1 : 0] == '"');
+      f[i] = {p + st + quoted, n - 2 * quoted};
+      pairs += quoted;
+      st = end + 1;
+    }
+    u32 q = seps[ix + N - 1].quotes;
+    bool valid = q - oldq == 2 * pairs;
+    oldq = q; start = st; ix += N;
+    if (LIKELY(valid)) fn(f);
+  }
+  // A short malformed final row still needs consuming; scan_old handles tails,
+  // missing final newlines, and partial lines held for the next read.
+  return scan_old<N>(p + std::min((size_t)start, len), cend, fend, eof, fn);
+}
+
 // Two-stage scanner: stage 1 computes comma/quote/newline masks for every 64-byte block
 // of [p, fend); stage 2 cuts lines branch-free from a 3-block window of those masks.
 // Same contract as scan_old.
 template <int N, class F>
 static const char* scan(const char* p, const char* cend, const char* fend, bool eof, F&& fn) {
+#ifdef INDEX_SCAN
+  return scan_index<N>(p, cend, fend, eof, fn);
+#endif
 #ifdef LINE_SCAN
   return scan_line<N>(p, cend, fend, eof, fn);
 #endif
@@ -2049,6 +2192,7 @@ int main() {
     DAY0 = floordiv(WS, DAYMS);
     NDAYS = (int)(floordiv(WE - 1, DAYMS) - DAY0 + 1);
   }
+  init_window_dates(WS, WE);
   {
     std::string s = read_file(DATA + "/products.csv");
     std::vector<std::pair<u64, u32>> prods;  // code, first-seen category index
