@@ -1796,6 +1796,7 @@ static i64 floordiv(i64 a, i64 b) { return a / b - ((a % b != 0) && ((a < 0) != 
 
 int main() {
   T0 = now_s();
+  umask(0);  // outputs deletable by whoever runs the container
   init_dates();
   const char* e;
   std::string DATA = (e = getenv("DATA_DIR")) ? e : "/data";
