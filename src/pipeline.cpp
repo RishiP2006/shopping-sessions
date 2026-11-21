@@ -38,6 +38,10 @@
 
 #include "parquet.hpp"
 
+#ifndef NO_PARSE_LOOKUP
+#define PARSE_LOOKUP 1
+#endif
+
 typedef uint64_t u64;
 typedef int64_t i64;
 typedef uint32_t u32;
@@ -831,7 +835,14 @@ static PartBuf<ClickRec> g_craw;  // valid clicks by user
 static PartBuf<ClickRec> g_cper;  // valid clicks by person
 static std::atomic<u64>* g_loser = nullptr;
 
+struct Pend {
+  u64 user, eid;
+  i32 ing;
+  u32 ts, pc;
+};
 struct alignas(64) TL {
+  Pend ring[16];
+  u32 rh = 0, rn = 0;
   std::vector<std::pair<u32, u32>> links;
   std::vector<u32> fresh;
   std::vector<UserRow> rows;
@@ -924,8 +935,34 @@ static inline u32 p2_of(u64 person) { return (u32)(hmix(person, K2) >> (64 - P2B
 
 static inline u32 pu_of(u64 user) { return (u32)(hmix(user, K4) >> (64 - PBITS)); }
 
+#ifdef PARSE_LOOKUP
+static inline void resolve_pend(int tid, const Pend& x) {
+  u64 person = g_links.lookup(x.user);
+  u32 ref = g_rec2.put(tid, p2_of(person), Rec2{person, x.ts, x.pc});
+  g_keys.put(tid, p1_of(x.eid), EKey{x.eid, x.ing, ref});
+}
+static inline void push_pend(int tid, TL& tl, const Pend& x) {
+  g_links.prefetch(x.user);
+  if (tl.rn == 16) {
+    resolve_pend(tid, tl.ring[tl.rh]);
+    tl.ring[tl.rh] = x;
+    tl.rh = (tl.rh + 1) & 15;
+  } else {
+    tl.ring[(tl.rh + tl.rn++) & 15] = x;
+  }
+}
+static void flush_pend(int tid, TL& tl) {
+  for (u32 i = 0; i < tl.rn; i++) resolve_pend(tid, tl.ring[(tl.rh + i) & 15]);
+  tl.rn = 0;
+  tl.rh = 0;
+}
+#endif
+
 static const char* parse_events(int tid, const char* p, const char* cend, const char* fend, bool eof) {
   const i64 wlen = WE - WS;
+#ifdef PARSE_LOOKUP
+  TL& tl = g_tl[tid];
+#endif
   return scan<7>(p, cend, fend, eof, [&](Fld* f) {
 #ifdef EXP_SCANONLY
     g_tl[tid].rows.reserve(0);
@@ -966,6 +1003,10 @@ static const char* parse_events(int tid, const char* p, const char* cend, const 
         pc = price | (cat << 24);
       }
       u64 user = pack7(f[1].p, f[1].n);
+#ifdef PARSE_LOOKUP
+      push_pend(tid, tl, Pend{user, k.eid, k.ing, (u32)ts, pc});
+      return;
+#endif
 #ifdef EXP_NOSCATTER
       k.ref = (u32)(user ^ ts ^ pc);
 #else
@@ -1074,7 +1115,9 @@ static void dedup_partition(u32 p, DedupScratch& S) {
 
 static void map_partition(int tid, u32 u) {
   const u64* lw = (const u64*)g_loser;
+  (void)lw;
   for (int t = 0; t < NT; t++) {
+#ifndef PARSE_LOOKUP
     g_pay.runs(t, u, [&](const EPay* a, const EPay* b) {
       u32 r = g_pay.ref(a);
       for (; a != b; a++, r++) {
@@ -1083,6 +1126,7 @@ static void map_partition(int tid, u32 u) {
         g_rec2.put(tid, p2_of(person), Rec2{person, a->ts, a->pc});
       }
     });
+#endif
     g_craw.each(t, u, [&](const ClickRec& c0) {
       ClickRec c = c0;
       c.who = g_links.lookup(c.who);
@@ -1197,7 +1241,15 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     }
   };
   size_t k0 = 0;
-  for (int t = 0; t < NT; t++) g_rec2.each(t, q, [&](const Rec2& r) {
+  const u64* lw = (const u64*)g_loser;
+  (void)lw;
+  for (int t = 0; t < NT; t++) g_rec2.runs(t, q, [&](const Rec2* ra, const Rec2* rb) {
+   u32 rr = g_rec2.ref(ra);
+   for (; ra != rb; ra++, rr++) {
+#ifdef PARSE_LOOKUP
+    if ((lw[rr >> 6] >> (rr & 63)) & 1) continue;
+#endif
+    const Rec2& r = *ra;
     size_t k = k0++;
     u64 i = hmix(r.person, K3) >> sh;
     u32 e;
@@ -1220,7 +1272,9 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     S.eidx[k] = e;
     S.tk[k] = ((u64)r.ts << 32) | (u64)k;
     S.pcs[k] = r.pc;
+   }
   });
+  n = k0;
   u32 off = 0;
   for (auto& e : S.ents) {
     e.off = off;
@@ -1691,8 +1745,13 @@ int main() {
   cap2 = cap2 + cap2 / 16 + 32;
   cap_per = cap_per + cap_per / 16 + 32;
   g_keys.init(cap1, NT, P1);
+#ifdef PARSE_LOOKUP
+  g_rec2.init(cap2, NT, P2);
+  g_loser = (std::atomic<u64>*)big_alloc((g_rec2.total_n / 64 + 1) * sizeof(u64));
+#else
   g_pay.init(cap_per, NT, P);
   g_loser = (std::atomic<u64>*)big_alloc((g_pay.total_n / 64 + 1) * sizeof(u64));
+#endif
   size_t click_est = click_bytes / 44 + 1024;
   size_t ccap = click_est / ((size_t)NT * P);
   ccap = ccap + ccap / 16 + 16;
@@ -1705,7 +1764,7 @@ int main() {
   if ((e = getenv("SS_CHUNK")) && atol(e) > 0) CH = (size_t)atol(e);
   if ((e = getenv("SS_RDBUF")) && atol(e) > 0) RDBUF = (size_t)atol(e);
   int nlinkchunks = 0;
-  for (int kind : {2, 0, 1}) {
+  for (int kind : {2, 1, 0}) {
     for (int fi = 0; fi < (int)g_files.size(); fi++) {
       if (g_files[fi].kind != kind) continue;
       size_t n = g_files[fi].size;
@@ -1718,15 +1777,30 @@ int main() {
   g_tl.resize(NT);
   std::atomic<size_t> next_chunk{0};
   std::atomic<int> links_left{nlinkchunks};
-  if (nlinkchunks == 0) run_union_find();
+  static std::atomic<bool> uf_done{false};
+  if (nlinkchunks == 0) {
+    run_union_find();
+    uf_done.store(true);
+  }
   parallel(NT, [&](int tid) {
     std::vector<char> vb(RDBUF + 512);
     while (true) {
       size_t ci = next_chunk.fetch_add(1);
       if (ci >= chunks.size()) break;
+#ifdef PARSE_LOOKUP
+      if (g_files[chunks[ci].file].kind == 0)
+        while (!uf_done.load(std::memory_order_acquire)) std::this_thread::yield();
+#endif
       process_chunk(tid, chunks[ci], vb);
-      if (g_files[chunks[ci].file].kind == 2 && links_left.fetch_sub(1) == 1) run_union_find();
+      if (g_files[chunks[ci].file].kind == 2 && links_left.fetch_sub(1) == 1) {
+        run_union_find();
+        uf_done.store(true, std::memory_order_release);
+      }
     }
+#ifdef PARSE_LOOKUP
+    flush_pend(tid, g_tl[tid]);
+    g_rec2.finish(tid);
+#endif
     g_keys.finish(tid);
     g_pay.finish(tid);
   });
@@ -1747,10 +1821,12 @@ int main() {
   logt("dedup");
   // phase 2b: map persons, scatter by person
   {
+#ifndef PARSE_LOOKUP
     if (PartBuf<Rec2>::total_for(cap2, NT, P2) <= g_keys.total_n)
       g_rec2.init(cap2, NT, P2, g_keys.base, g_keys.total_n);  // keys are dead: reuse their memory
     else
       g_rec2.init(cap2, NT, P2);
+#endif
     std::atomic<u32> nx{0};
     parallel(NT, [&](int tid) {
       while (true) {
