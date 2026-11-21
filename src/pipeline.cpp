@@ -1,5 +1,16 @@
 // Shopping Sessions: native pipeline.
 // Reads $DATA_DIR, writes $OUTPUT_DIR/{user_daily,campaign_daily}/*.parquet
+//
+// Phases
+//   1. parse (all CSVs, parallel, SIMD block scanner). Links are parsed first and a
+//      single thread runs union-find while the others parse events and clicks.
+//      Each event copy writes a 16-byte dedup key (scattered by event_id hash) and,
+//      if valid, a 16-byte payload into a global sequential array.
+//   2a. per event_id partition: find duplicate copies, mark losing copies in a bitmap.
+//   2b. scan payloads sequentially, skip losers, map user -> person, scatter by person.
+//       Clicks are mapped and scattered the same way.
+//   3. per person partition: group, sort, sessionize, attribute, aggregate.
+//   4. write Parquet.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -31,32 +42,41 @@ typedef uint64_t u64;
 typedef int64_t i64;
 typedef uint32_t u32;
 typedef int32_t i32;
-typedef unsigned __int128 u128;
+
+#define LIKELY(x) __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
 
 static const i64 DAYMS = 86400000LL;
 static const i64 GAPMS = 1800000LL;
 static const i64 WEEKMS = 604800000LL;
 static const u64 LONGBIT = 1ULL << 63;
+static const u32 NOREF = 0xFFFFFFFFu;
 
 static double now_s() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 static double T0;
-static void logt(const char* what) { fprintf(stderr, "[%7.3f] %s\n", now_s() - T0, what); }
-
-// ---------------------------------------------------------------- string codes
-// Strings of length <= 10 over [0-9A-Z_a-z] are packed into 60 bits, order preserving.
-// Anything else is interned and gets LONGBIT | id.
-static uint8_t SYM[256];
-static char UNSYM[64];
-static void init_sym() {
-  int v = 1;
-  for (int c = '0'; c <= '9'; c++) { SYM[c] = v; UNSYM[v] = (char)c; v++; }
-  for (int c = 'A'; c <= 'Z'; c++) { SYM[c] = v; UNSYM[v] = (char)c; v++; }
-  SYM['_'] = v; UNSYM[v] = '_'; v++;
-  for (int c = 'a'; c <= 'z'; c++) { SYM[c] = v; UNSYM[v] = (char)c; v++; }
+static bool g_verbose = true;
+static void logt(const char* what) {
+  if (g_verbose) fprintf(stderr, "[%7.3f] %s\n", now_s() - T0, what);
 }
 
+static void* big_alloc(size_t bytes) {
+  if (bytes == 0) bytes = 4096;
+  void* m = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (m == MAP_FAILED) {
+    fprintf(stderr, "mmap %zu failed\n", bytes);
+    exit(1);
+  }
+#ifdef MADV_HUGEPAGE
+  madvise(m, bytes, MADV_HUGEPAGE);
+#endif
+  return m;
+}
+
+// ---------------------------------------------------------------- string codes
+// ASCII strings of length 1..9 without NUL pack into 63 bits, 7 bits per char, first char
+// most significant: numeric order == byte-wise order. Anything else is interned: LONGBIT|id.
 static std::mutex g_imu;
 static std::unordered_map<std::string, u32> g_imap;
 static std::deque<std::string> g_istr;
@@ -72,34 +92,47 @@ static u64 intern_slow(const char* p, u32 n) {
   return LONGBIT | id;
 }
 
-static inline u64 encode(const char* p, u32 n) {
-  if (n <= 10) {
-    u64 c = 0;
-    u32 bad = 0;
-    for (u32 i = 0; i < n; i++) {
-      u32 s = SYM[(uint8_t)p[i]];
-      bad |= (s == 0);
-      c = (c << 6) | s;
+// p[0..15] must be readable.
+static inline u64 pack7(const char* p, u32 n) {
+  if (LIKELY(n - 1 < 9)) {
+    u64 w;
+    memcpy(&w, p, 8);
+    u64 hi = 0, pad = 0;
+    if (n < 8) {
+      u64 keep = (~0ULL) >> (64 - 8 * n);
+      w &= keep;
+      pad = 0x0101010101010101ULL & ~keep;
+    } else if (n == 9) {
+      hi = (uint8_t)p[8];
+      pad = 0;
     }
-    if (!bad) return c << (6 * (10 - n));
+    u64 x = w | pad;
+    u64 bad = ((w | hi) & 0x8080808080808080ULL) | ((x - 0x0101010101010101ULL) & ~x & 0x8080808080808080ULL);
+    if (LIKELY(!bad && !(n == 9 && hi == 0))) {
+      u64 be = __builtin_bswap64(w);
+#if defined(__BMI2__)
+      u64 pk = _pext_u64(be, 0x7F7F7F7F7F7F7F7FULL);
+#else
+      u64 pk = 0;
+      for (int i = 7; i >= 0; i--) pk = (pk << 7) | ((be >> (8 * i)) & 0x7F);
+#endif
+      return (pk << 7) | hi;
+    }
   }
   return intern_slow(p, n);
 }
 
-static void decode(u64 code, std::string& out) {
-  out.clear();
-  if (code & LONGBIT) {
-    std::lock_guard<std::mutex> lk(g_imu);
-    out = g_istr[(u32)(code & 0xffffffffu)];
-    return;
+static u64 encode_str(const std::string& s) {
+  if (s.size() <= 9) {
+    char buf[32];
+    memset(buf, 0, sizeof buf);
+    memcpy(buf, s.data(), s.size());
+    return pack7(buf, (u32)s.size());
   }
-  for (int i = 0; i < 10; i++) {
-    u32 s = (u32)((code >> (6 * (9 - i))) & 63);
-    if (!s) break;
-    out.push_back(UNSYM[s]);
-  }
+  return intern_slow(s.data(), (u32)s.size());
 }
-// decode without lock (only call when no concurrent interning)
+
+// no locking: only call when no thread can be interning
 static inline u32 decode_fast(u64 code, char* out) {
   if (code & LONGBIT) {
     const std::string& s = g_istr[(u32)(code & 0xffffffffu)];
@@ -107,16 +140,22 @@ static inline u32 decode_fast(u64 code, char* out) {
     return (u32)s.size();
   }
   u32 n = 0;
-  for (int i = 0; i < 10; i++) {
-    u32 s = (u32)((code >> (6 * (9 - i))) & 63);
-    if (!s) break;
-    out[n++] = UNSYM[s];
+  for (int i = 0; i < 9; i++) {
+    u32 c = (u32)((code >> (7 * (8 - i))) & 0x7F);
+    if (!c) break;
+    out[n++] = (char)c;
   }
   return n;
 }
-static inline u32 code_len_bound(u64 code) {
-  if (code & LONGBIT) return (u32)g_istr[(u32)(code & 0xffffffffu)].size();
-  return 10;
+static void decode(u64 code, std::string& out) {
+  if (code & LONGBIT) {
+    std::lock_guard<std::mutex> lk(g_imu);
+    out = g_istr[(u32)(code & 0xffffffffu)];
+    return;
+  }
+  char buf[16];
+  u32 n = decode_fast(code, buf);
+  out.assign(buf, n);
 }
 
 static bool key_less(u64 a, u64 b) {
@@ -137,67 +176,105 @@ static inline i64 days_from_civil(i64 y, i64 m, i64 d) {
   return era * 146097 + doe - 719468;
 }
 static inline bool is_leap(i64 y) { return (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0); }
-static inline int dim(i64 y, int m) {
-  static const int D[13] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+static inline u32 dim(i64 y, u32 m) {
+  static const u32 D[13] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
   return m == 2 ? (is_leap(y) ? 29 : 28) : D[m];
 }
-static inline bool d2(const char* p, int& v) {
-  unsigned a = (unsigned)(uint8_t)p[0] - '0', b = (unsigned)(uint8_t)p[1] - '0';
-  if (a > 9 || b > 9) return false;
-  v = (int)(a * 10 + b);
+static const u32 TY0 = 1900, TYN = 400;
+static i32 g_mstart[TYN * 12];
+static uint8_t g_mdim[TYN * 12];
+static void init_dates() {
+  for (u32 y = 0; y < TYN; y++)
+    for (u32 m = 1; m <= 12; m++) {
+      g_mstart[y * 12 + m - 1] = (i32)days_from_civil(TY0 + y, m, 1);
+      g_mdim[y * 12 + m - 1] = (uint8_t)dim(TY0 + y, m);
+    }
+}
+
+// "YYYY-MM-DDTHH:MM:SS" followed by c-word check; returns ms without zone
+template <u32 CMASK, u32 CVAL>
+static inline bool civil_core(const char* p, i64& out) {
+  u64 a, b;
+  u32 c;
+  memcpy(&a, p, 8);
+  memcpy(&b, p + 8, 8);
+  memcpy(&c, p + 16, 4);
+  if ((a & 0xFF0000FF00000000ULL) != 0x2D00002D00000000ULL) return false;
+  if ((b & 0x0000FF0000FF0000ULL) != 0x00003A0000540000ULL) return false;
+  if ((c & CMASK) != CVAL) return false;
+  const u64 Z = 0x3030303030303030ULL;
+  u64 da = (a ^ Z) & 0x00FFFF00FFFFFFFFULL, db = (b ^ Z) & 0xFFFF00FFFF00FFFFULL;
+  u32 dc = (c ^ 0x30303030u) & 0x00FFFF00u;
+  if (((da | db) & 0xF0F0F0F0F0F0F0F0ULL) | (dc & 0xF0F0F0F0u)) return false;
+  if ((((da + 0x0606060606060606ULL) | (db + 0x0606060606060606ULL)) & 0x1010101010101010ULL) |
+      ((dc + 0x06060606u) & 0x10101010u))
+    return false;
+#define BY(x, i) ((u32)((x) >> (8 * (i))) & 0xFF)
+  u32 Y = BY(da, 0) * 1000 + BY(da, 1) * 100 + BY(da, 2) * 10 + BY(da, 3);
+  u32 M = BY(da, 5) * 10 + BY(da, 6);
+  u32 D = BY(db, 0) * 10 + BY(db, 1);
+  u32 h = BY(db, 3) * 10 + BY(db, 4);
+  u32 mi = BY(db, 6) * 10 + BY(db, 7);
+  u32 s = BY(dc, 1) * 10 + BY(dc, 2);
+#undef BY
+  if (M - 1 > 11 || h > 23 || mi > 59 || s > 59 || D == 0) return false;
+  i64 days;
+  if (LIKELY(Y - TY0 < TYN)) {
+    u32 k = (Y - TY0) * 12 + M - 1;
+    if (D > g_mdim[k]) return false;
+    days = g_mstart[k] + (i64)D - 1;
+  } else {
+    if (D > dim(Y, M)) return false;
+    days = days_from_civil(Y, M, D);
+  }
+  out = (days * 86400 + (i64)(h * 3600 + mi * 60 + s)) * 1000;
   return true;
 }
-// Returns false for a bad timestamp; values of F3 that are absurdly large are also "bad"
-// since they can't be inside any window.
-static bool parse_ts(const char* p, u32 n, i64& out) {
-  if (n == 0) return false;
-  if ((n == 20 || n == 25) && p[4] == '-') {
-    int y1, y2, M, D, h, mi, s;
-    if (!d2(p, y1) || !d2(p + 2, y2) || !d2(p + 5, M) || p[7] != '-' || !d2(p + 8, D) || p[10] != 'T' ||
-        !d2(p + 11, h) || p[13] != ':' || !d2(p + 14, mi) || p[16] != ':' || !d2(p + 17, s))
-      return false;
-    i64 Y = y1 * 100 + y2;
-    if (M < 1 || M > 12 || D < 1 || D > dim(Y, M) || h > 23 || mi > 59 || s > 59) return false;
-    i64 off = 0;
-    if (n == 20) {
-      if (p[19] != 'Z') return false;
-    } else {
-      char sg = p[19];
-      int oh, om;
-      if ((sg != '+' && sg != '-') || !d2(p + 20, oh) || p[22] != ':' || !d2(p + 23, om)) return false;
-      if (oh > 23 || om > 59) return false;
-      off = (i64)(oh * 60 + om) * 60000;
-      if (sg == '-') off = -off;
-    }
-    out = (days_from_civil(Y, M, D) * 86400 + h * 3600 + mi * 60 + s) * 1000 - off;
+
+// p[0..n+15] readable
+static inline bool parse_ts(const char* p, u32 n, i64& out) {
+  if (n == 20) {
+    if (p[4] == '-') return civil_core<0xFF0000FFu, 0x5A00003Au>(p, out);
+  } else if (n == 25) {
+    if (p[4] != '-') goto digits;
+    i64 base;
+    if (!civil_core<0x000000FFu, 0x0000003Au>(p, base)) return false;
+    char sg = p[19];
+    u32 oh0 = (u32)(uint8_t)p[20] - '0', oh1 = (u32)(uint8_t)p[21] - '0', om0 = (u32)(uint8_t)p[23] - '0',
+        om1 = (u32)(uint8_t)p[24] - '0';
+    if ((sg != '+' && sg != '-') || p[22] != ':' || oh0 > 9 || oh1 > 9 || om0 > 9 || om1 > 9) return false;
+    u32 oh = oh0 * 10 + oh1, om = om0 * 10 + om1;
+    if (oh > 23 || om > 59) return false;
+    i64 off = (i64)(oh * 60 + om) * 60000;
+    out = sg == '+' ? base - off : base + off;
     return true;
   }
+digits:
+  if (n == 0) return false;
   u32 i = 0;
   while (i < n && p[i] == '0') i++;
   u32 sig = n - i;
+  if (sig > 17) {
+    return false;  // > 1e17 ms: far outside any window (or not digits: bad anyway)
+  }
   i64 v = 0;
   for (u32 j = i; j < n; j++) {
-    unsigned d = (unsigned)(uint8_t)p[j] - '0';
+    u32 d = (u32)(uint8_t)p[j] - '0';
     if (d > 9) return false;
-    if (sig <= 17) v = v * 10 + d;
+    v = v * 10 + d;
   }
-  if (sig > 17) return false;  // > 1e17 ms: far outside any window
   out = v;
   return true;
 }
 
-static bool parse_price(const char* p, u32 n, u32& out) {
+static inline bool parse_price(const char* p, u32 n, u32& out) {
   if (n == 0) return false;
   u32 i = 0;
   while (i < n && p[i] == '0') i++;
-  if (n - i > 8) {
-    for (u32 j = i; j < n; j++)
-      if ((unsigned)(uint8_t)p[j] - '0' > 9) return false;
-    return false;
-  }
+  if (n - i > 8) return false;
   u32 v = 0;
   for (u32 j = i; j < n; j++) {
-    unsigned d = (unsigned)(uint8_t)p[j] - '0';
+    u32 d = (u32)(uint8_t)p[j] - '0';
     if (d > 9) return false;
     v = v * 10 + d;
   }
@@ -206,7 +283,7 @@ static bool parse_price(const char* p, u32 n, u32& out) {
   return true;
 }
 
-// ---------------------------------------------------------------- CSV tokenizer
+// ---------------------------------------------------------------- CSV scanning
 struct Fld {
   const char* p;
   u32 n;
@@ -249,14 +326,75 @@ static inline void masks64(const char* p, u64& c, u64& q, u64& nl) {
 #endif
 }
 
-static inline int ctz128(u128 x) {
-  u64 lo = (u64)x;
-  if (lo) return __builtin_ctzll(lo);
-  return 64 + __builtin_ctzll((u64)(x >> 64));
+// Scan lines starting at p (a line start) while the line start is < cend.
+// fend is the end of the file; >= 64 readable bytes follow it.
+template <int N, class F>
+static void scan(const char* p, const char* cend, const char* fend, F&& fn) {
+  Fld f[N];
+  u32 nf = 0;
+  const char* fs = p;
+  const char* blk = p;
+  u32 qacc = 0, qline0 = 0;
+  auto finish = [&](u32 qnow) {
+    if (nf == N) {
+      u32 ql = qnow - qline0;
+      if (UNLIKELY(ql != 0)) {
+        u32 pairs = 0;
+        for (int i = 0; i < N; i++) {
+          if (f[i].n >= 2 && f[i].p[0] == '"' && f[i].p[f[i].n - 1] == '"') {
+            pairs++;
+            f[i].p++;
+            f[i].n -= 2;
+          }
+        }
+        if (pairs * 2 != ql) return;
+      }
+      fn(f);
+    }
+  };
+  while (blk < fend) {
+    u64 C, Q, NL;
+    masks64(blk, C, Q, NL);
+    size_t rem = (size_t)(fend - blk);
+    if (UNLIKELY(rem < 64)) {
+      u64 vm = (1ULL << rem) - 1;
+      C &= vm;
+      Q &= vm;
+      NL &= vm;
+    }
+    u64 S = C | NL;
+    while (S) {
+      u32 pos = (u32)__builtin_ctzll(S);
+      S &= S - 1;
+      const char* e = blk + pos;
+      if (LIKELY(nf < (u32)N)) {
+        f[nf].p = fs;
+        f[nf].n = (u32)(e - fs);
+      }
+      nf++;
+      fs = e + 1;
+      if ((NL >> pos) & 1) {
+        u32 qnow = qacc + (u32)__builtin_popcountll(Q & ((1ULL << pos) - 1));
+        finish(qnow);
+        nf = 0;
+        qline0 = qnow;
+        if (fs >= cend) return;
+      }
+    }
+    qacc += (u32)__builtin_popcountll(Q);
+    blk += 64;
+  }
+  if (nf > 0 || fs < fend) {
+    if (nf < (u32)N) {
+      f[nf].p = fs;
+      f[nf].n = (u32)(fend - fs);
+    }
+    nf++;
+    finish(qacc);
+  }
 }
-static inline int pop128(u128 x) { return __builtin_popcountll((u64)x) + __builtin_popcountll((u64)(x >> 64)); }
 
-// Generic scalar tokenizer for one line [p, nl). Returns false if malformed.
+// Generic scalar tokenizer for one line [p, e) (small files).
 template <int N>
 static bool tok_scalar(const char* p, const char* e, Fld* f) {
   int nf = 0;
@@ -287,71 +425,12 @@ static bool tok_scalar(const char* p, const char* e, Fld* f) {
   return nf == N;
 }
 
-// Tokenize the line starting at p. Sets next to the start of the following line.
-template <int N>
-static inline bool tok(const char* p, const char* fe, const char*& next, Fld* f) {
-  if (fe - p >= 128) {
-    u64 c0, q0, n0;
-    masks64(p, c0, q0, n0);
-    u128 C, Q;
-    u32 L;
-    if (n0) {
-      L = (u32)__builtin_ctzll(n0);
-      u64 lm = L ? ((~0ULL) >> (64 - L)) : 0;
-      C = c0 & lm;
-      Q = q0 & lm;
-    } else {
-      u64 c1, q1, n1;
-      masks64(p + 64, c1, q1, n1);
-      if (!n1) goto slow;
-      L = 64 + (u32)__builtin_ctzll(n1);
-      u64 lm = (L > 64) ? ((~0ULL) >> (128 - L)) : 0;
-      C = (u128)c0 | ((u128)(c1 & lm) << 64);
-      Q = (u128)q0 | ((u128)(q1 & lm) << 64);
-    }
-    next = p + L + 1;
-    if (pop128(C) != N - 1) return false;
-    u32 s = 0;
-    for (int i = 0; i < N - 1; i++) {
-      u32 e = (u32)ctz128(C);
-      C &= C - 1;
-      f[i].p = p + s;
-      f[i].n = e - s;
-      s = e + 1;
-    }
-    f[N - 1].p = p + s;
-    f[N - 1].n = L - s;
-    if (Q) {
-      for (int i = 0; i < N; i++) {
-        u32 st = (u32)(f[i].p - p), len = f[i].n;
-        u128 lowm = len >= 128 ? ~(u128)0 : (((u128)1 << len) - 1);
-        u128 bits = (Q >> st) & lowm;
-        if (!bits) continue;
-        if (len >= 2 && bits == ((u128)1 | ((u128)1 << (len - 1)))) {
-          f[i].p++;
-          f[i].n -= 2;
-        } else
-          return false;
-      }
-    }
-    return true;
-  }
-slow:
-  const char* e = (const char*)memchr(p, '\n', (size_t)(fe - p));
-  if (!e) {
-    e = fe;
-    next = fe;
-  } else
-    next = e + 1;
-  return tok_scalar<N>(p, e, f);
-}
-
-// ---------------------------------------------------------------- small hash tables
-static inline u64 hmix(u64 x, u64 k) { return (x ^ (x >> 31)) * k; }
+// ---------------------------------------------------------------- hash tables
+static inline u64 hmix(u64 x, u64 k) { return (x ^ (x >> 29)) * k; }
 static const u64 K1 = 0x9E3779B97F4A7C15ULL, K2 = 0xC2B2AE3D27D4EB4FULL, K3 = 0x165667B19E3779F9ULL,
                  K4 = 0xD6E8FEB86659FD93ULL, K5 = 0xFF51AFD7ED558CCDULL;
 
-struct SmallTab {  // u64 -> u32, single threaded build
+struct SmallTab {  // u64 (nonzero) -> u32
   std::vector<u64> keys;
   std::vector<u32> vals;
   int shift = 64;
@@ -382,10 +461,12 @@ struct SmallTab {  // u64 -> u32, single threaded build
   }
 };
 
-// Concurrent link table: code -> slot, plus union-find
+struct LSlot {
+  std::atomic<u64> key;
+  u64 name;
+};
 struct LinkTab {
-  std::atomic<u64>* keys = nullptr;
-  u64* name = nullptr;
+  LSlot* s = nullptr;
   u32* parent = nullptr;
   u64 mask = 0;
   int shift = 64;
@@ -393,21 +474,21 @@ struct LinkTab {
     size_t cap = 1024;
     int lg = 10;
     while (cap < n * 2) { cap <<= 1; lg++; }
-    keys = (std::atomic<u64>*)calloc(cap, sizeof(u64));
-    name = (u64*)malloc(cap * sizeof(u64));
-    parent = (u32*)malloc(cap * sizeof(u32));
+    s = (LSlot*)big_alloc(cap * sizeof(LSlot));
+    parent = (u32*)big_alloc(cap * sizeof(u32));
     mask = cap - 1;
     shift = 64 - lg;
   }
+  inline u64 slot_of(u64 k) const { return hmix(k, K4) >> shift; }
   inline u32 insert(u64 k, std::vector<u32>& fresh) {
-    u64 i = hmix(k, K4) >> shift;
+    u64 i = slot_of(k);
     while (true) {
-      u64 x = keys[i].load(std::memory_order_relaxed);
+      u64 x = s[i].key.load(std::memory_order_relaxed);
       if (x == k) return (u32)i;
       if (x == 0) {
         u64 exp = 0;
-        if (keys[i].compare_exchange_strong(exp, k, std::memory_order_relaxed)) {
-          name[i] = k;
+        if (s[i].key.compare_exchange_strong(exp, k, std::memory_order_relaxed)) {
+          s[i].name = k;
           parent[i] = (u32)i;
           fresh.push_back((u32)i);
           return (u32)i;
@@ -417,14 +498,12 @@ struct LinkTab {
       i = (i + 1) & mask;
     }
   }
-  inline u64 slot_of(u64 k) const { return hmix(k, K4) >> shift; }
-  inline void prefetch(u64 k) const { __builtin_prefetch((const void*)&keys[slot_of(k)]); }
+  inline void prefetch(u64 k) const { __builtin_prefetch((const void*)&s[slot_of(k)]); }
   inline u64 lookup(u64 k) const {
     u64 i = slot_of(k);
-    const u64* kk = (const u64*)keys;
     while (true) {
-      u64 x = kk[i];
-      if (x == k) return name[i];
+      u64 x = s[i].key.load(std::memory_order_relaxed);
+      if (x == k) return s[i].name;
       if (!x) return k;
       i = (i + 1) & mask;
     }
@@ -439,13 +518,15 @@ struct LinkTab {
 };
 
 // ---------------------------------------------------------------- records
-struct Rec1 {  // event copy, partitioned by event_id
+struct EKey {  // event copy, partitioned by event_id
   u64 eid;
+  i32 ing;  // ingest seconds since window_start (clamped)
+  u32 ref;  // payload index or NOREF if this copy is invalid
+};
+struct EPay {  // valid copy payload
   u64 user;
-  u32 ts;    // ms since window_start
-  i32 ing;   // ingest seconds since window_start (clamped)
-  u32 pc;    // price | cat << 24 (purchase only), 0 for view/cart
-  u32 valid;
+  u32 ts;  // ms since window_start
+  u32 pc;  // price | cat << 24 (purchase), 0 otherwise
 };
 struct Rec2 {  // surviving event, partitioned by person
   u64 person;
@@ -459,19 +540,99 @@ struct ClickRec {
   u32 camp;
 };
 
+// Partitioned buffer: a region per (thread, partition) in one big array, plus overflow
+// chunks from the same array. Every element has a stable global index (its "ref").
+template <class T>
+struct PartBuf {
+  static const u32 CH = 512;
+  T* base = nullptr;
+  size_t cap = 0, main_n = 0, total_n = 0;
+  int P = 0, NTh = 0;
+  std::atomic<size_t> ovf_next{0};
+  std::vector<T*> cur, end;
+  std::vector<std::vector<size_t>> extra;
+  static size_t total_for(size_t cap_per, int nth, int parts) {
+    size_t m = cap_per * nth * parts;
+    return m + m / 2 + (size_t)nth * parts * CH + CH;
+  }
+  void init(size_t cap_per, int nth, int parts, void* mem = nullptr, size_t mem_n = 0) {
+    cap = cap_per;
+    P = parts;
+    NTh = nth;
+    main_n = cap * nth * parts;
+    total_n = mem ? mem_n : total_for(cap_per, nth, parts);
+    base = mem ? (T*)mem : (T*)big_alloc(total_n * sizeof(T));
+    ovf_next.store(main_n);
+    size_t R = (size_t)nth * parts;
+    cur.resize(R);
+    end.resize(R);
+    extra.assign(R, {});
+    for (size_t i = 0; i < R; i++) {
+      cur[i] = base + i * cap;
+      end[i] = cur[i] + cap;
+    }
+  }
+  __attribute__((noinline)) T* grow(size_t i) {
+    size_t s = ovf_next.fetch_add(CH);
+    if (s + CH > total_n) {
+      fprintf(stderr, "partition buffer overflow\n");
+      exit(1);
+    }
+    extra[i].push_back(s);
+    end[i] = base + s + CH;
+    return base + s;
+  }
+  inline T* slot(int t, u32 p) {
+    size_t i = (size_t)t * P + p;
+    T* w = cur[i];
+    if (UNLIKELY(w == end[i])) w = grow(i);
+    cur[i] = w + 1;
+    return w;
+  }
+  inline void push(int t, u32 p, const T& x) { *slot(t, p) = x; }
+  inline u32 ref(const T* x) const { return (u32)(x - base); }
+  size_t count(int t, u32 p) const {
+    size_t i = (size_t)t * P + p;
+    const auto& ex = extra[i];
+    if (ex.empty()) return (size_t)(cur[i] - (base + i * cap));
+    return cap + (ex.size() - 1) * CH + (size_t)(cur[i] - (base + ex.back()));
+  }
+  // fn(const T* begin, const T* end) for each contiguous run of (t, p)
+  template <class F>
+  void runs(int t, u32 p, F&& fn) const {
+    size_t i = (size_t)t * P + p;
+    const auto& ex = extra[i];
+    const T* r0 = base + i * cap;
+    if (ex.empty()) {
+      fn(r0, (const T*)cur[i]);
+      return;
+    }
+    fn(r0, r0 + cap);
+    for (size_t k = 0; k < ex.size(); k++) {
+      const T* c0 = base + ex[k];
+      fn(c0, k + 1 == ex.size() ? (const T*)cur[i] : c0 + CH);
+    }
+  }
+  template <class F>
+  void each(int t, u32 p, F&& fn) const {
+    runs(t, p, [&](const T* a, const T* b) {
+      for (; a != b; a++) fn(*a);
+    });
+  }
+};
+
 // ---------------------------------------------------------------- globals
 static int NT = 8;
-static i64 WS, WE, CB;  // window start/end, click base
+static i64 WS, WE, CB;
 static i64 DAY0;
 static int NDAYS;
-static int P1BITS, P2BITS, P1, P2;
-static SmallTab g_prod;   // product code -> category index
-static SmallTab g_camp;   // campaign code -> 1-based index
-static std::vector<std::string> g_cats;  // sorted category names
+static int PBITS, P;
+static SmallTab g_prod;
+static SmallTab g_camp;
+static std::vector<std::string> g_cats;
 static u32 g_unknown_cat;
-static std::vector<std::string> g_camp_id, g_camp_ch;  // index 0 = organic
+static std::vector<std::string> g_camp_id, g_camp_ch;
 static LinkTab g_links;
-static int g_nolookup = 0;
 
 struct FileMap {
   const char* data;
@@ -487,24 +648,25 @@ static std::vector<FileMap> g_files;
 struct CD {
   i64 sessions, purch, rev, assisted;
 };
-
 struct UserRow {
   u64 name;
   i32 day;
-  u32 topcat;  // UINT32_MAX = null
+  u32 topcat;
   i64 sessions, events, rev;
 };
 
+static PartBuf<EKey> g_keys;   // by event_id
+static PartBuf<EPay> g_pay;    // by user (same hash bits as the link table)
+static PartBuf<Rec2> g_rec2;   // by person (reuses g_keys memory)
+static PartBuf<ClickRec> g_craw;  // valid clicks by user
+static PartBuf<ClickRec> g_cper;  // valid clicks by person
+static std::atomic<u64>* g_loser = nullptr;
+
 struct alignas(64) TL {
-  std::vector<std::vector<Rec1>> b1;
-  std::vector<ClickRec> clicks;
   std::vector<std::pair<u32, u32>> links;
   std::vector<u32> fresh;
-  std::vector<std::vector<Rec2>> b2;
-  std::vector<std::vector<ClickRec>> cb;
   std::vector<UserRow> rows;
   std::vector<CD> cd;
-  size_t ev_lines = 0;
 };
 static std::vector<TL> g_tl;
 
@@ -532,6 +694,7 @@ static std::vector<std::string> list_csv(const std::string& dir) {
   return out;
 }
 
+// Map a file with >= 64 KiB of zero padding after it.
 static void map_file(const std::string& path, int kind) {
   int fd = open(path.c_str(), O_RDONLY);
   if (fd < 0) return;
@@ -542,13 +705,23 @@ static void map_file(const std::string& path, int kind) {
     close(fd);
     return;
   }
-  void* m = mmap(nullptr, n, PROT_READ, MAP_PRIVATE, fd, 0);
+  size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+  size_t mapped = (n + pg - 1) / pg * pg;
+  size_t total = mapped + (64 << 10);
+  void* res = mmap(nullptr, total, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (res == MAP_FAILED) {
+    fprintf(stderr, "mmap reserve failed\n");
+    exit(1);
+  }
+  void* m = mmap(res, n, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
   close(fd);
-  if (m == MAP_FAILED) return;
+  if (m == MAP_FAILED) {
+    fprintf(stderr, "mmap %s failed\n", path.c_str());
+    exit(1);
+  }
   g_files.push_back({(const char*)m, n, kind});
 }
 
-// iterate the data lines of a small in-memory CSV (skips header)
 template <int N, class F>
 static void each_line(const std::string& s, F fn) {
   const char* p = s.data();
@@ -580,98 +753,85 @@ static bool find_json_str(const std::string& s, const char* key, std::string& ou
 }
 
 // ---------------------------------------------------------------- phase 1: parse
-static inline u32 p1_of(u64 eid) { return (u32)(hmix(eid, K1) >> (64 - P1BITS)); }
-static inline u32 p2_of(u64 person) { return (u32)(hmix(person, K2) >> (64 - P2BITS)); }
+static inline u32 p1_of(u64 eid) { return (u32)(hmix(eid, K1) >> (64 - PBITS)); }
+static inline u32 p2_of(u64 person) { return (u32)(hmix(person, K2) >> (64 - PBITS)); }
 
-static void parse_events(TL& tl, const char* p, const char* end, const char* fe) {
-  Fld f[7];
+static inline u32 pu_of(u64 user) { return (u32)(hmix(user, K4) >> (64 - PBITS)); }
+
+static void parse_events(int tid, const char* p, const char* cend, const char* fend) {
   const i64 wlen = WE - WS;
-  size_t lines = 0;
-  while (p < end) {
-    const char* next;
-    bool ok = tok<7>(p, fe, next, f);
-    p = next;
-    lines++;
-    if (!ok || f[0].n == 0) continue;
-    Rec1 r;
-    r.eid = encode(f[0].p, f[0].n);
+  scan<7>(p, cend, fend, [&](Fld* f) {
+    if (UNLIKELY(f[0].n == 0)) return;
+    EKey k;
+    k.eid = pack7(f[0].p, f[0].n);
+    k.ref = NOREF;
     i64 ing;
-    if (!parse_ts(f[3].p, f[3].n, ing)) {
-      ing = INT64_MAX / 4;
-    }
-    i64 ings = (ing - WS) / 1000;  // ingest is whole seconds (F1)
-    if (ing < WS && (ing - WS) % 1000) ings--;
-    if (ings > INT32_MAX) ings = INT32_MAX;
-    if (ings < INT32_MIN) ings = INT32_MIN;
-    r.ing = (i32)ings;
-    r.valid = 0;
-    r.user = 0;
-    r.ts = 0;
-    r.pc = 0;
+    if (UNLIKELY(!parse_ts(f[3].p, f[3].n, ing))) ing = (i64)1 << 60;
+    i64 ings = (ing - WS) / 1000;
+    if (UNLIKELY(ings > INT32_MAX)) ings = INT32_MAX;
+    if (UNLIKELY(ings < INT32_MIN)) ings = INT32_MIN;
+    k.ing = (i32)ings;
     do {
-      if (f[1].n == 0 || f[5].n == 0) break;
+      if (UNLIKELY(f[1].n == 0 || f[5].n == 0)) break;
       i64 ts;
-      if (!parse_ts(f[2].p, f[2].n, ts)) break;
+      if (UNLIKELY(!parse_ts(f[2].p, f[2].n, ts))) break;
       ts -= WS;
-      if (ts < 0 || ts >= wlen) break;
-      if (ing - (ts + WS) > DAYMS) break;
+      if (UNLIKELY((u64)ts >= (u64)wlen)) break;
+      if (UNLIKELY(ing - (ts + WS) > DAYMS)) break;
       u32 pc = 0;
       const char* t = f[4].p;
+      u32 w4;
+      memcpy(&w4, t, 4);
       if (f[4].n == 4) {
-        if (!(memcmp(t, "view", 4) == 0 || memcmp(t, "cart", 4) == 0)) break;
-      } else if (f[4].n == 8 && memcmp(t, "purchase", 8) == 0) {
+        if (w4 != 0x77656976u /*view*/ && w4 != 0x74726163u /*cart*/) break;
+      } else {
+        u64 w8;
+        memcpy(&w8, t, 8);
+        if (f[4].n != 8 || w8 != 0x6573616863727570ULL /*purchase*/) break;
         u32 price;
         if (!parse_price(f[6].p, f[6].n, price)) break;
         u32 cat;
-        u64 pcode = encode(f[5].p, f[5].n);
-        if (!g_prod.get(pcode, cat)) cat = g_unknown_cat;
+        if (!g_prod.get(pack7(f[5].p, f[5].n), cat)) cat = g_unknown_cat;
         pc = price | (cat << 24);
-      } else
-        break;
-      r.user = encode(f[1].p, f[1].n);
-      r.ts = (u32)ts;
-      r.pc = pc;
-      r.valid = 1;
+      }
+      u64 user = pack7(f[1].p, f[1].n);
+      EPay* py = g_pay.slot(tid, pu_of(user));
+      py->user = user;
+      py->ts = (u32)ts;
+      py->pc = pc;
+      k.ref = g_pay.ref(py);
     } while (0);
-    tl.b1[p1_of(r.eid)].push_back(r);
-  }
-  tl.ev_lines += lines;
+    g_keys.push(tid, p1_of(k.eid), k);
+  });
 }
 
-static void parse_clicks(TL& tl, const char* p, const char* end, const char* fe) {
-  Fld f[4];
+static void parse_clicks(int tid, const char* p, const char* cend, const char* fend) {
   const i64 clen = WE - CB;
-  while (p < end) {
-    const char* next;
-    bool ok = tok<4>(p, fe, next, f);
-    p = next;
-    if (!ok || f[0].n == 0 || f[1].n == 0 || f[2].n == 0) continue;
+  scan<4>(p, cend, fend, [&](Fld* f) {
+    if (f[0].n == 0 || f[1].n == 0 || f[2].n == 0) return;
     i64 ts;
-    if (!parse_ts(f[3].p, f[3].n, ts)) continue;
+    if (!parse_ts(f[3].p, f[3].n, ts)) return;
     ts -= CB;
-    if (ts < 0 || ts >= clen) continue;
+    if ((u64)ts >= (u64)clen) return;
     u32 camp;
-    if (!g_camp.get(encode(f[2].p, f[2].n), camp)) continue;
+    if (!g_camp.get(pack7(f[2].p, f[2].n), camp)) return;
     ClickRec c;
-    c.who = encode(f[1].p, f[1].n);
-    c.cid = encode(f[0].p, f[0].n);
+    c.who = pack7(f[1].p, f[1].n);
+    c.cid = pack7(f[0].p, f[0].n);
     c.ts = (u32)ts;
     c.camp = camp;
-    tl.clicks.push_back(c);
-  }
+    g_craw.push(tid, pu_of(c.who), c);
+  });
 }
 
-static void parse_links(TL& tl, const char* p, const char* end, const char* fe) {
-  Fld f[2];
-  while (p < end) {
-    const char* next;
-    bool ok = tok<2>(p, fe, next, f);
-    p = next;
-    if (!ok || f[0].n == 0 || f[1].n == 0) continue;
-    u32 a = g_links.insert(encode(f[0].p, f[0].n), tl.fresh);
-    u32 b = g_links.insert(encode(f[1].p, f[1].n), tl.fresh);
+static void parse_links(int tid, const char* p, const char* cend, const char* fend) {
+  TL& tl = g_tl[tid];
+  scan<2>(p, cend, fend, [&](Fld* f) {
+    if (f[0].n == 0 || f[1].n == 0) return;
+    u32 a = g_links.insert(pack7(f[0].p, f[0].n), tl.fresh);
+    u32 b = g_links.insert(pack7(f[1].p, f[1].n), tl.fresh);
     if (a != b) tl.links.push_back({a, b});
-  }
+  });
 }
 
 static void run_union_find() {
@@ -680,83 +840,79 @@ static void run_union_find() {
     for (auto& pr : tl.links) {
       u32 a = L.find(pr.first), b = L.find(pr.second);
       if (a == b) continue;
-      // root keeps the smaller name
-      if (key_less(L.name[b], L.name[a])) std::swap(a, b);
+      if (key_less(L.s[b].name, L.s[a].name)) std::swap(a, b);
       L.parent[b] = a;
     }
   }
   for (auto& tl : g_tl)
-    for (u32 s : tl.fresh) L.name[s] = L.name[L.find(s)];
+    for (u32 s : tl.fresh) L.s[s].name = L.s[L.find(s)].name;
 }
 
-// ---------------------------------------------------------------- phase 2: dedup + person mapping
+// ---------------------------------------------------------------- phase 2
 struct DedupScratch {
-  std::vector<u64> keys;
-  std::vector<Rec1*> ptr;
-  std::vector<Rec1*> win;
+  std::vector<EKey> a;
+  std::vector<u32> tab;
 };
 
-static void dedup_partition(int tid, int p, DedupScratch& S) {
-  TL& me = g_tl[tid];
+static inline void mark_loser(u32 ref) {
+  if (ref != NOREF) g_loser[ref >> 6].fetch_or(1ULL << (ref & 63), std::memory_order_relaxed);
+}
+
+static void dedup_partition(u32 p, DedupScratch& S) {
   size_t n = 0;
-  for (auto& tl : g_tl) n += tl.b1[p].size();
-  if (!n) return;
+  for (int t = 0; t < NT; t++) n += g_keys.count(t, p);
+  if (n < 2) return;
+  S.a.resize(n);
+  size_t k = 0;
+  for (int t = 0; t < NT; t++) g_keys.each(t, p, [&](const EKey& x) { S.a[k++] = x; });
   size_t cap = 16;
   int lg = 4;
-  while (cap < n * 2) { cap <<= 1; lg++; }
-  if (S.keys.size() < cap) { S.keys.resize(cap); S.ptr.resize(cap); }
-  memset(S.keys.data(), 0, cap * sizeof(u64));
+  while (cap < n + n / 2) { cap <<= 1; lg++; }
+  if (S.tab.size() < cap) S.tab.resize(cap);
+  u32* tab = S.tab.data();
+  memset(tab, 0, cap * sizeof(u32));
   u64 mask = cap - 1;
   int sh = 64 - lg;
-  size_t used = 0;
-  for (auto& tl : g_tl) {
-    for (Rec1& r : tl.b1[p]) {
-      u64 i = hmix(r.eid, K3) >> sh;
-      while (true) {
-        u64 k = S.keys[i];
-        if (k == r.eid) {
-          if (r.ing < S.ptr[i]->ing) S.ptr[i] = &r;
-          break;
-        }
-        if (!k) {
-          S.keys[i] = r.eid;
-          S.ptr[i] = &r;
-          used++;
-          break;
-        }
-        i = (i + 1) & mask;
+  const EKey* A = S.a.data();
+  for (u32 i = 0; i < n; i++) {
+    const EKey& x = A[i];
+    u64 h = hmix(x.eid, K3) >> sh;
+    while (true) {
+      u32 t = tab[h];
+      if (!t) {
+        tab[h] = i + 1;
+        break;
       }
+      const EKey& w = A[t - 1];
+      if (w.eid == x.eid) {
+        if (x.ing < w.ing) {
+          mark_loser(w.ref);
+          tab[h] = i + 1;
+        } else
+          mark_loser(x.ref);
+        break;
+      }
+      h = (h + 1) & mask;
     }
-  }
-  S.win.clear();
-  if (used == n) {
-    for (auto& tl : g_tl)
-      for (Rec1& r : tl.b1[p])
-        if (r.valid) S.win.push_back(&r);
-  } else {
-    for (size_t i = 0; i < cap; i++)
-      if (S.keys[i] && S.ptr[i]->valid) S.win.push_back(S.ptr[i]);
-  }
-  const size_t D = 16;
-  size_t m = S.win.size();
-  for (size_t i = 0; i < m && i < D; i++) g_links.prefetch(S.win[i]->user);
-  for (size_t i = 0; i < m; i++) {
-    if (i + D < m) g_links.prefetch(S.win[i + D]->user);
-    Rec1* r = S.win[i];
-    u64 person = g_nolookup ? r->user : g_links.lookup(r->user);
-    me.b2[p2_of(person)].push_back({person, r->ts, r->pc});
   }
 }
 
-static void map_clicks(int tid, std::vector<ClickRec>& v, size_t beg, size_t end) {
-  TL& me = g_tl[tid];
-  const size_t D = 16;
-  for (size_t i = beg; i < end && i < beg + D; i++) g_links.prefetch(v[i].who);
-  for (size_t i = beg; i < end; i++) {
-    if (i + D < end) g_links.prefetch(v[i + D].who);
-    ClickRec c = v[i];
-    c.who = g_links.lookup(c.who);
-    me.cb[p2_of(c.who)].push_back(c);
+static void map_partition(int tid, u32 u) {
+  const u64* lw = (const u64*)g_loser;
+  for (int t = 0; t < NT; t++) {
+    g_pay.runs(t, u, [&](const EPay* a, const EPay* b) {
+      u32 r = g_pay.ref(a);
+      for (; a != b; a++, r++) {
+        if ((lw[r >> 6] >> (r & 63)) & 1) continue;
+        u64 person = g_links.lookup(a->user);
+        g_rec2.push(tid, p2_of(person), Rec2{person, a->ts, a->pc});
+      }
+    });
+    g_craw.each(t, u, [&](const ClickRec& c0) {
+      ClickRec c = c0;
+      c.who = g_links.lookup(c.who);
+      g_cper.push(tid, p2_of(c.who), c);
+    });
   }
 }
 
@@ -771,28 +927,34 @@ struct ClickE {
   u64 cid;
 };
 struct SessScratch {
-  std::vector<u32> tab;  // index+1 into ents
+  std::vector<u32> tab;
   std::vector<PEnt> ents;
   std::vector<u32> eidx;
+  std::vector<Rec2> in;
   std::vector<u64> ev;
   std::vector<u32> cidx;
   std::vector<ClickE> cl;
   std::vector<u32> ccnt, cpos, clist;
   std::vector<i64> catsum;
   std::vector<u32> cattouch;
+  std::vector<u64> tmp;
 };
 
-static void radix_sort_u64(u64* a, size_t n, std::vector<u64>& tmp) {
-  // sort by low 32 bits..? we sort whole key (ts<<32|pc) by the top 32 bits (ts) using 3 passes of 11 bits
+static void radix_sort_ts(u64* a, size_t n, std::vector<u64>& tmp) {
   tmp.resize(n);
   u64* src = a;
   u64* dst = tmp.data();
   for (int pass = 0; pass < 3; pass++) {
     int sh = 32 + pass * 11;
-    size_t cnt[2048] = {0};
+    size_t cnt[2048];
+    memset(cnt, 0, sizeof cnt);
     for (size_t i = 0; i < n; i++) cnt[(src[i] >> sh) & 2047]++;
     size_t s = 0;
-    for (int b = 0; b < 2048; b++) { size_t c = cnt[b]; cnt[b] = s; s += c; }
+    for (int b = 0; b < 2048; b++) {
+      size_t c = cnt[b];
+      cnt[b] = s;
+      s += c;
+    }
     for (size_t i = 0; i < n; i++) dst[cnt[(src[i] >> sh) & 2047]++] = src[i];
     std::swap(src, dst);
   }
@@ -801,14 +963,20 @@ static void radix_sort_u64(u64* a, size_t n, std::vector<u64>& tmp) {
 
 static inline bool click_less(const ClickE& a, const ClickE& b) {
   if (a.ts != b.ts) return a.ts < b.ts;
+  if (!((a.cid | b.cid) & LONGBIT)) return a.cid < b.cid;
   return key_less(a.cid, b.cid);
 }
 
-static void session_partition(int tid, int q, SessScratch& S) {
+static void session_partition(int tid, u32 q, SessScratch& S) {
   TL& me = g_tl[tid];
   size_t n = 0;
-  for (auto& tl : g_tl) n += tl.b2[q].size();
+  for (int t = 0; t < NT; t++) n += g_rec2.count(t, q);
   if (!n) return;
+  S.in.resize(n);
+  {
+    size_t k = 0;
+    for (int t = 0; t < NT; t++) g_rec2.each(t, q, [&](const Rec2& x) { S.in[k++] = x; });
+  }
   size_t cap = 64;
   int lg = 6;
   while (cap < n / 4) { cap <<= 1; lg++; }
@@ -829,46 +997,46 @@ static void session_partition(int tid, int q, SessScratch& S) {
       S.tab[i] = e + 1;
     }
   };
-  size_t k = 0;
-  for (auto& tl : g_tl) {
-    for (const Rec2& r : tl.b2[q]) {
-      u64 i = hmix(r.person, K3) >> sh;
-      u32 e;
-      while (true) {
-        u32 t = S.tab[i];
-        if (!t) {
-          e = (u32)S.ents.size();
-          S.ents.push_back({r.person, 0, 0, 0, 0});
-          S.tab[i] = e + 1;
-          if (S.ents.size() * 2 > cap) rehash();
-          break;
-        }
-        if (S.ents[t - 1].key == r.person) {
-          e = t - 1;
-          break;
-        }
-        i = (i + 1) & mask;
+  for (size_t k = 0; k < n; k++) {
+    const Rec2& r = S.in[k];
+    u64 i = hmix(r.person, K3) >> sh;
+    u32 e;
+    while (true) {
+      u32 t = S.tab[i];
+      if (!t) {
+        e = (u32)S.ents.size();
+        S.ents.push_back({r.person, 0, 0, 0, 0});
+        S.tab[i] = e + 1;
+        if (S.ents.size() * 2 > cap) rehash();
+        break;
       }
-      S.ents[e].cnt++;
-      S.eidx[k++] = e;
+      if (S.ents[t - 1].key == r.person) {
+        e = t - 1;
+        break;
+      }
+      i = (i + 1) & mask;
     }
+    S.ents[e].cnt++;
+    S.eidx[k] = e;
   }
   u32 off = 0;
-  for (auto& e : S.ents) { e.off = off; off += e.cnt; e.cnt = 0; }
+  for (auto& e : S.ents) {
+    e.off = off;
+    off += e.cnt;
+    e.cnt = 0;
+  }
   S.ev.resize(n);
-  k = 0;
-  for (auto& tl : g_tl)
-    for (const Rec2& r : tl.b2[q]) {
-      PEnt& e = S.ents[S.eidx[k++]];
-      S.ev[e.off + e.cnt++] = ((u64)r.ts << 32) | r.pc;
-    }
+  for (size_t k = 0; k < n; k++) {
+    PEnt& e = S.ents[S.eidx[k]];
+    S.ev[e.off + e.cnt++] = ((u64)S.in[k].ts << 32) | S.in[k].pc;
+  }
   // clicks
   size_t nc = 0;
-  for (auto& tl : g_tl) nc += tl.cb[q].size();
+  for (int t = 0; t < NT; t++) nc += g_cper.count(t, q);
   S.cidx.resize(nc);
-  k = 0;
-  for (auto& tl : g_tl)
-    for (const ClickRec& c : tl.cb[q]) {
+  size_t k = 0;
+  for (int t = 0; t < NT; t++)
+    g_cper.each(t, q, [&](const ClickRec& c) {
       u64 i = hmix(c.who, K3) >> sh;
       u32 e = UINT32_MAX;
       while (true) {
@@ -882,25 +1050,32 @@ static void session_partition(int tid, int q, SessScratch& S) {
       }
       S.cidx[k++] = e;
       if (e != UINT32_MAX) S.ents[e].ccnt++;
-    }
+    });
   off = 0;
-  for (auto& e : S.ents) { e.coff = off; off += e.ccnt; e.ccnt = 0; }
+  for (auto& e : S.ents) {
+    e.coff = off;
+    off += e.ccnt;
+    e.ccnt = 0;
+  }
   S.cl.resize(off);
   k = 0;
-  for (auto& tl : g_tl)
-    for (const ClickRec& c : tl.cb[q]) {
+  for (int t = 0; t < NT; t++)
+    g_cper.each(t, q, [&](const ClickRec& c) {
       u32 ei = S.cidx[k++];
-      if (ei == UINT32_MAX) continue;
+      if (ei == UINT32_MAX) return;
       PEnt& e = S.ents[ei];
       S.cl[e.coff + e.ccnt++] = {c.ts, c.camp, c.cid};
-    }
+    });
 
-  std::vector<u64> tmp;
   const u32 ncamp = (u32)g_camp_id.size();
-  if (S.ccnt.size() < ncamp) { S.ccnt.assign(ncamp, 0); S.cpos.assign(ncamp, 0); }
+  if (S.ccnt.size() < ncamp) {
+    S.ccnt.assign(ncamp, 0);
+    S.cpos.assign(ncamp, 0);
+  }
   if (S.catsum.size() < g_cats.size()) S.catsum.assign(g_cats.size(), 0);
   CD* cd = me.cd.data();
   const int ND = NDAYS;
+  const i64 dayoff = WS - DAY0 * DAYMS;
 
   for (auto& e : S.ents) {
     u64* ev = S.ev.data() + e.off;
@@ -910,13 +1085,16 @@ static void session_partition(int tid, int q, SessScratch& S) {
         for (u32 i = 1; i < m; i++) {
           u64 x = ev[i];
           u32 j = i;
-          while (j > 0 && ev[j - 1] > x) { ev[j] = ev[j - 1]; j--; }
+          while (j > 0 && ev[j - 1] > x) {
+            ev[j] = ev[j - 1];
+            j--;
+          }
           ev[j] = x;
         }
-      } else if (m < 50000)
+      } else if (m < 20000)
         std::sort(ev, ev + m);
       else
-        radix_sort_u64(ev, m, tmp);
+        radix_sort_ts(ev, m, S.tmp);
     }
     ClickE* cl = S.cl.data() + e.coff;
     u32 kc = e.ccnt;
@@ -927,7 +1105,6 @@ static void session_partition(int tid, int q, SessScratch& S) {
         if (cl[i].cid != cl[w - 1].cid) cl[w++] = cl[i];
       kc = w;
     }
-    // walk sessions
     u32 lo = 0, hi = 0;
     S.clist.clear();
     i32 cur_day = -1;
@@ -939,7 +1116,10 @@ static void session_partition(int tid, int q, SessScratch& S) {
       i64 best = -1;
       for (u32 c : S.cattouch) {
         i64 v = S.catsum[c];
-        if (v > best || (v == best && c < top)) { best = v; top = c; }
+        if (v > best || (v == best && c < top)) {
+          best = v;
+          top = c;
+        }
         S.catsum[c] = 0;
       }
       S.cattouch.clear();
@@ -952,7 +1132,7 @@ static void session_partition(int tid, int q, SessScratch& S) {
       u32 prev = s;
       i64 rev = 0;
       bool purch = false;
-      i32 day = (i32)(((WS + (i64)s) - (DAY0 * DAYMS)) / DAYMS);
+      i32 day = (i32)((dayoff + (i64)s) / DAYMS);
       if (day != cur_day) {
         flush_day();
         cur_day = day;
@@ -960,7 +1140,7 @@ static void session_partition(int tid, int q, SessScratch& S) {
       u32 j = i;
       while (j < m) {
         u32 t = (u32)(ev[j] >> 32);
-        if ((i64)t - (i64)prev > GAPMS) break;
+        if (t - prev > (u32)GAPMS) break;
         prev = t;
         u32 pc = (u32)ev[j];
         if (pc) {
@@ -975,11 +1155,13 @@ static void session_partition(int tid, int q, SessScratch& S) {
       d_sess++;
       d_ev += j - i;
       d_rev += rev;
-      // attribution: clicks with ts in [s, s + WEEK] in click base
       u64 sc = (u64)s + (u64)WEEKMS;
       while (hi < kc && cl[hi].ts <= sc) {
         u32 c = cl[hi].camp;
-        if (S.ccnt[c]++ == 0) { S.cpos[c] = (u32)S.clist.size(); S.clist.push_back(c); }
+        if (S.ccnt[c]++ == 0) {
+          S.cpos[c] = (u32)S.clist.size();
+          S.clist.push_back(c);
+        }
         hi++;
       }
       while (lo < hi && cl[lo].ts < s) {
@@ -1023,26 +1205,27 @@ static void write_user_file(const std::string& path, std::vector<UserRow>& rows)
   cols[4] = {"revenue_cents", pq::INT64, pq::L_NONE, false, {}, {}};
   cols[5] = {"top_category", pq::BYTE_ARRAY, pq::L_STRING, true, {}, {}};
   size_t n = rows.size();
-  // user_id
   {
     std::string& s = cols[0].values;
-    s.reserve(n * 14);
-    char buf[64];
+    size_t bound = 0;
+    for (auto& r : rows) bound += 4 + ((r.name & LONGBIT) ? g_istr[(u32)(r.name & 0xffffffffu)].size() : 9);
+    s.resize(bound);
+    char* o = &s[0];
     for (auto& r : rows) {
-      if (r.name & LONGBIT) {
-        const std::string& x = g_istr[(u32)(r.name & 0xffffffffu)];
-        pq::put_str(s, x.data(), (u32)x.size());
-      } else {
-        u32 len = decode_fast(r.name, buf);
-        pq::put_str(s, buf, len);
-      }
+      u32 len = decode_fast(r.name, o + 4);
+      memcpy(o, &len, 4);
+      o += 4 + len;
     }
+    s.resize((size_t)(o - &s[0]));
   }
   {
     std::string& s = cols[1].values;
     s.resize(n * 4);
     char* o = &s[0];
-    for (auto& r : rows) { memcpy(o, &r.day, 4); o += 4; }
+    for (auto& r : rows) {
+      memcpy(o, &r.day, 4);
+      o += 4;
+    }
   }
   for (int c = 0; c < 3; c++) {
     std::string& s = cols[2 + c].values;
@@ -1058,7 +1241,8 @@ static void write_user_file(const std::string& path, std::vector<UserRow>& rows)
     pq::DefLevels dl;
     std::string& s = cols[5].values;
     for (auto& r : rows) {
-      if (r.topcat == UINT32_MAX) dl.add(0);
+      if (r.topcat == UINT32_MAX)
+        dl.add(0);
       else {
         dl.add(1);
         const std::string& c = g_cats[r.topcat];
@@ -1114,33 +1298,37 @@ static i64 floordiv(i64 a, i64 b) { return a / b - ((a % b != 0) && ((a < 0) != 
 
 int main() {
   T0 = now_s();
-  init_sym();
+  init_dates();
   const char* e;
   std::string DATA = (e = getenv("DATA_DIR")) ? e : "/data";
   std::string OUT = (e = getenv("OUTPUT_DIR")) ? e : "/output";
-  g_nolookup = getenv("NOLOOKUP") ? 1 : 0;
   NT = (e = getenv("NCPU")) ? atoi(e) : (int)std::thread::hardware_concurrency();
   if (NT < 1) NT = 1;
   if (NT > 64) NT = 64;
 
-  // manifest
   {
     std::string m = read_file(DATA + "/manifest.json");
     std::string a, b;
-    if (!find_json_str(m, "window_start", a) || !find_json_str(m, "window_end", b) ||
-        !parse_ts(a.data(), (u32)a.size(), WS) || !parse_ts(b.data(), (u32)b.size(), WE)) {
+    a.reserve(64);
+    b.reserve(64);
+    if (!find_json_str(m, "window_start", a) || !find_json_str(m, "window_end", b)) {
       fprintf(stderr, "bad manifest\n");
+      return 1;
+    }
+    a.resize(a.size() + 32, '\0');
+    b.resize(b.size() + 32, '\0');
+    if (!parse_ts(a.data(), (u32)(a.size() - 32), WS) || !parse_ts(b.data(), (u32)(b.size() - 32), WE)) {
+      fprintf(stderr, "bad manifest times\n");
       return 1;
     }
     CB = WS - WEEKMS;
     if (WE - CB >= (i64)UINT32_MAX || WE <= WS) {
-      fprintf(stderr, "window too long\n");
+      fprintf(stderr, "unsupported window\n");
       return 1;
     }
     DAY0 = floordiv(WS, DAYMS);
     NDAYS = (int)(floordiv(WE - 1, DAYMS) - DAY0 + 1);
   }
-  // products & categories
   {
     std::string s = read_file(DATA + "/products.csv");
     std::vector<std::pair<std::string, std::string>> prods;
@@ -1162,9 +1350,12 @@ int main() {
     for (u32 i = 0; i < cats.size(); i++) ci[cats[i]] = i;
     g_unknown_cat = ci["unknown"];
     g_prod.init(prods.size());
-    for (auto& pr : prods) g_prod.put(encode(pr.first.data(), (u32)pr.first.size()), ci[pr.second]);
+    for (auto& pr : prods) {
+      u64 code = encode_str(pr.first);
+      u32 tmp;
+      if (!g_prod.get(code, tmp)) g_prod.put(code, ci[pr.second]);
+    }
   }
-  // campaigns
   {
     std::string s = read_file(DATA + "/campaigns.csv");
     g_camp_id.push_back("organic");
@@ -1177,34 +1368,41 @@ int main() {
     g_camp.init(cs.size());
     for (auto& c : cs) {
       u32 tmp;
-      u64 code = encode(c.first.data(), (u32)c.first.size());
+      u64 code = encode_str(c.first);
       if (g_camp.get(code, tmp)) continue;
       g_camp.put(code, (u32)g_camp_id.size());
       g_camp_id.push_back(c.first);
       g_camp_ch.push_back(c.second);
     }
   }
-  // files
-  size_t ev_bytes = 0, link_bytes = 0;
+  size_t ev_bytes = 0, link_bytes = 0, click_bytes = 0;
   for (auto& f : list_csv(DATA + "/links")) map_file(f, 2);
   for (auto& f : list_csv(DATA + "/events")) map_file(f, 0);
   for (auto& f : list_csv(DATA + "/clicks")) map_file(f, 1);
   for (auto& f : g_files) {
     if (f.kind == 0) ev_bytes += f.size;
     if (f.kind == 2) link_bytes += f.size;
+    if (f.kind == 1) click_bytes += f.size;
   }
-  size_t ev_est = ev_bytes / 70 + 1024;
-  P1BITS = 4;
-  while ((1u << P1BITS) * 24000ull < ev_est && P1BITS < 11) P1BITS++;
-  P2BITS = P1BITS;
-  P1 = 1 << P1BITS;
-  P2 = 1 << P2BITS;
+  size_t ev_est = ev_bytes / 74 + 1024;
+  PBITS = 4;
+  while ((1ull << PBITS) * 16384ull < ev_est && PBITS < 12) PBITS++;
+  P = 1 << PBITS;
   g_links.init(link_bytes / 10 + 1024);
+  size_t cap_per = ev_est / ((size_t)NT * P);
+  cap_per = cap_per + cap_per / 4 + 64;
+  g_keys.init(cap_per, NT, P);
+  g_pay.init(cap_per, NT, P);
+  g_loser = (std::atomic<u64>*)big_alloc((g_pay.total_n / 64 + 1) * sizeof(u64));
+  size_t click_est = click_bytes / 44 + 1024;
+  size_t ccap = click_est / ((size_t)NT * P);
+  ccap = ccap + ccap / 4 + 16;
+  g_craw.init(ccap, NT, P);
+  g_cper.init(ccap, NT, P);
   logt("setup");
 
-  // chunks: links first, then the rest (largest first)
   std::vector<Chunk> chunks;
-  const size_t CH = 4 << 20;
+  const size_t CH = 2 << 20;
   int nlinkchunks = 0;
   for (int kind : {2, 0, 1}) {
     for (int fi = 0; fi < (int)g_files.size(); fi++) {
@@ -1217,15 +1415,10 @@ int main() {
     }
   }
   g_tl.resize(NT);
-  size_t per = ev_est / ((size_t)NT * P1) + 16;
   std::atomic<size_t> next_chunk{0};
   std::atomic<int> links_left{nlinkchunks};
-  std::atomic<bool> uf_done{nlinkchunks == 0};
   if (nlinkchunks == 0) run_union_find();
   parallel(NT, [&](int tid) {
-    TL& tl = g_tl[tid];
-    tl.b1.resize(P1);
-    for (auto& v : tl.b1) v.reserve(per + per / 4);
     while (true) {
       size_t ci = next_chunk.fetch_add(1);
       if (ci >= chunks.size()) break;
@@ -1241,60 +1434,53 @@ int main() {
         const char* nl = (const char*)memchr(p, '\n', (size_t)(fe - p));
         p = nl ? nl + 1 : fe;
       }
-      const char* end = base + c.end;
-      if (fm.kind == 0) parse_events(tl, p, end, fe);
-      else if (fm.kind == 1) parse_clicks(tl, p, end, fe);
-      else {
-        parse_links(tl, p, end, fe);
-        if (links_left.fetch_sub(1) == 1) {
-          run_union_find();
-          uf_done.store(true);
-        }
+      const char* cend = base + c.end;
+      if (p < cend) {
+        if (fm.kind == 0)
+          parse_events(tid, p, cend, fe);
+        else if (fm.kind == 1)
+          parse_clicks(tid, p, cend, fe);
+        else
+          parse_links(tid, p, cend, fe);
       }
+      if (fm.kind == 2 && links_left.fetch_sub(1) == 1) run_union_find();
     }
   });
   logt("parse");
 
-  // phase 2
+  // phase 2a: dedup
   {
-    struct Item { int kind; int a; size_t b, c; };
-    std::vector<Item> items;
-    for (int t = 0; t < NT; t++) {
-      size_t n = g_tl[t].clicks.size();
-      const size_t S = 1 << 16;
-      for (size_t b = 0; b < n; b += S) items.push_back({1, t, b, std::min(n, b + S)});
-    }
-    for (int p = 0; p < P1; p++) items.push_back({0, p, 0, 0});
-    std::atomic<size_t> nx{0};
+    std::atomic<u32> nx{0};
     parallel(NT, [&](int tid) {
-      TL& me = g_tl[tid];
-      me.b2.resize(P2);
-      me.cb.resize(P2);
-      size_t per2 = ev_est / ((size_t)NT * P2) + 16;
-      for (auto& v : me.b2) v.reserve(per2);
       DedupScratch S;
       while (true) {
-        size_t i = nx.fetch_add(1);
-        if (i >= items.size()) break;
-        Item it = items[i];
-        if (it.kind == 0) dedup_partition(tid, it.a, S);
-        else map_clicks(tid, g_tl[it.a].clicks, it.b, it.c);
+        u32 p = nx.fetch_add(1);
+        if (p >= (u32)P) break;
+        dedup_partition(p, S);
       }
     });
   }
   logt("dedup");
-  // free phase-1 buffers in parallel
-  parallel(NT, [&](int tid) {
-    std::vector<std::vector<Rec1>>().swap(g_tl[tid].b1);
-    std::vector<ClickRec>().swap(g_tl[tid].clicks);
-  });
+  // phase 2b: map persons, scatter by person
+  {
+    g_rec2.init(cap_per, NT, P, g_keys.base, g_keys.total_n);  // keys are dead: reuse their memory
+    std::atomic<u32> nx{0};
+    parallel(NT, [&](int tid) {
+      while (true) {
+        u32 u = nx.fetch_add(1);
+        if (u >= (u32)P) break;
+        map_partition(tid, u);
+      }
+    });
+  }
+  logt("map");
 
   // phase 3
   {
-    std::vector<std::pair<size_t, int>> order;
-    for (int q = 0; q < P2; q++) {
+    std::vector<std::pair<size_t, u32>> order;
+    for (u32 q = 0; q < (u32)P; q++) {
       size_t n = 0;
-      for (auto& tl : g_tl) n += tl.b2[q].size();
+      for (int t = 0; t < NT; t++) n += g_rec2.count(t, q);
       order.push_back({n, q});
     }
     std::sort(order.begin(), order.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -1312,7 +1498,6 @@ int main() {
   }
   logt("sessions");
 
-  // output
   std::string UD = OUT + "/user_daily", CDD = OUT + "/campaign_daily";
   mkdir(OUT.c_str(), 0777);
   mkdir(UD.c_str(), 0777);
@@ -1327,7 +1512,7 @@ int main() {
       snprintf(nm, sizeof nm, "/part-%05d.parquet", tid);
       write_user_file(UD + nm, me.rows);
     }
-    if (tid == 0) {
+    if (tid == NT - 1 || NT == 1) {
       for (auto& tl : g_tl)
         for (size_t i = 0; i < total.size(); i++) {
           total[i].sessions += tl.cd[i].sessions;
