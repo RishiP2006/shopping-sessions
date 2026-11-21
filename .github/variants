@@ -1,2 +1,4 @@
-submitted a1bc47903fe409a66c6bf6a82a16c1a129740fac --
 current HEAD --
+prof HEAD -- -DPROF_STEPS
+scanonly HEAD -- -DEXP_SCANONLY
+noscatter HEAD -- -DEXP_NOSCATTER

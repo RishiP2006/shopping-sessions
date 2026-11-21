@@ -59,6 +59,19 @@ static double now_s() {
 }
 static double T0;
 static bool g_verbose = true;
+#ifdef PROF_STEPS
+static double g_st[64][16];
+#define STEP_BEGIN double _t0 = now_s();
+#define STEP(i)                  \
+  {                              \
+    double _t1 = now_s();        \
+    g_st[tid][i] += _t1 - _t0;   \
+    _t0 = _t1;                   \
+  }
+#else
+#define STEP_BEGIN
+#define STEP(i)
+#endif
 static void logt(const char* what) {
   if (g_verbose) fprintf(stderr, "[%7.3f] %s\n", now_s() - T0, what);
 }
@@ -1214,13 +1227,15 @@ static inline void mark_loser(u32 ref) {
   if (ref != NOREF) g_loser[ref >> 6].fetch_or(1ULL << (ref & 63), std::memory_order_relaxed);
 }
 
-static void dedup_partition(u32 p, DedupScratch& S) {
+static void dedup_partition(int tid, u32 p, DedupScratch& S) {
+  STEP_BEGIN
   size_t n = 0;
   for (int t = 0; t < NT; t++) n += g_keys.count(t, p);
   if (n < 2) return;
   S.a.resize(n);
   size_t k = 0;
   for (int t = 0; t < NT; t++) g_keys.each(t, p, [&](const EKey& x) { S.a[k++] = x; });
+  STEP(5)
   size_t cap = 16;
   int lg = 4;
   while (cap < n + n / 2) { cap <<= 1; lg++; }
@@ -1251,9 +1266,11 @@ static void dedup_partition(u32 p, DedupScratch& S) {
       h = (h + 1) & mask;
     }
   }
+  STEP(6)
 }
 
 static void map_partition(int tid, u32 u) {
+  STEP_BEGIN
   const u64* lw = (const u64*)g_loser;
   (void)lw;
   for (int t = 0; t < NT; t++) {
@@ -1267,11 +1284,13 @@ static void map_partition(int tid, u32 u) {
       }
     });
 #endif
+    STEP(7)
     g_craw.each(t, u, [&](const ClickRec& c0) {
       ClickRec c = c0;
       c.who = g_links.lookup(c.who);
       g_cper.push(tid, p2_of(c.who), c);
     });
+    STEP(8)
   }
 }
 
@@ -1354,6 +1373,7 @@ __attribute__((always_inline)) static inline bool click_less(const ClickE& a, co
 }
 
 static void session_partition(int tid, u32 q, SessScratch& S) {
+  STEP_BEGIN
   TL& me = g_tl[tid];
   size_t n = 0;
   for (int t = 0; t < NT; t++) n += g_rec2.count(t, q);
@@ -1415,6 +1435,7 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
    }
   });
   n = k0;
+  STEP(0)
   u32 off = 0;
   for (auto& e : S.ents) {
     e.off = off;
@@ -1422,6 +1443,7 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     e.cnt = 0;
   }
   S.ev.resize(n);
+  STEP(1)
 #ifdef SESS_PERSORT
   for (size_t k = 0; k < n; k++) {
     PEnt& e = S.ents[S.eidx[k]];
@@ -1453,6 +1475,7 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     S.ev[e.off + e.cnt++] = (x & 0xFFFFFFFF00000000ULL) | S.pcs[k];
   }
 #endif
+  STEP(2)
   // clicks
   size_t nc = 0;
   for (int t = 0; t < NT; t++) nc += g_cper.count(t, q);
@@ -1498,6 +1521,7 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     }
   }
 
+  STEP(3)
   const u32 ncamp = (u32)g_camp_id.size();
   if (S.ccnt.size() < ncamp) {
     S.ccnt.assign(ncamp, 0);
@@ -1614,6 +1638,7 @@ static void session_partition(int tid, u32 q, SessScratch& S) {
     for (u32 c : S.clist) S.ccnt[c] = 0;
     S.clist.clear();
   }
+  STEP(4)
 }
 
 // ---------------------------------------------------------------- output
@@ -1830,29 +1855,54 @@ int main() {
   }
   {
     std::string s = read_file(DATA + "/products.csv");
-    std::vector<std::pair<std::string, std::string>> prods;
-    std::vector<std::string> cats;
+    std::vector<std::pair<u64, u32>> prods;  // code, first-seen category index
+    std::unordered_map<std::string, u32> seen;
+    std::vector<std::string> names;
+    std::string last;
+    u32 lastid = 0;
     each_line<2>(s, [&](Fld* f) {
       if (f[0].n == 0) return;
-      prods.push_back({std::string(f[0].p, f[0].n), std::string(f[1].p, f[1].n)});
-      cats.push_back(std::string(f[1].p, f[1].n));
+      char buf[32];
+      u64 code;
+      if (f[0].n <= 9) {
+        memset(buf, 0, sizeof buf);
+        memcpy(buf, f[0].p, f[0].n);
+        code = pack7(buf, f[0].n);
+      } else
+        code = intern_slow(f[0].p, f[0].n);
+      u32 id;
+      if (!names.empty() && last.size() == f[1].n && memcmp(last.data(), f[1].p, f[1].n) == 0)
+        id = lastid;
+      else {
+        std::string c(f[1].p, f[1].n);
+        auto it = seen.find(c);
+        if (it == seen.end()) {
+          id = (u32)names.size();
+          seen.emplace(c, id);
+          names.push_back(c);
+        } else
+          id = it->second;
+        last = c;
+        lastid = id;
+      }
+      prods.push_back({code, id});
     });
-    cats.push_back("unknown");
+    std::vector<std::string> cats = names;
+    if (!seen.count("unknown")) cats.push_back("unknown");
     std::sort(cats.begin(), cats.end());
-    cats.erase(std::unique(cats.begin(), cats.end()), cats.end());
     if (cats.size() > 255) {
       fprintf(stderr, "too many categories\n");
       return 1;
     }
     g_cats = cats;
-    std::unordered_map<std::string, u32> ci;
-    for (u32 i = 0; i < cats.size(); i++) ci[cats[i]] = i;
-    g_unknown_cat = ci["unknown"];
+    std::vector<u32> remap(names.size());
+    for (u32 i = 0; i < names.size(); i++)
+      remap[i] = (u32)(std::lower_bound(cats.begin(), cats.end(), names[i]) - cats.begin());
+    g_unknown_cat = (u32)(std::lower_bound(cats.begin(), cats.end(), std::string("unknown")) - cats.begin());
     g_prod.init(prods.size());
     for (auto& pr : prods) {
-      u64 code = encode_str(pr.first);
       u32 tmp;
-      if (!g_prod.get(code, tmp)) g_prod.put(code, ci[pr.second]);
+      if (!g_prod.get(pr.first, tmp)) g_prod.put(pr.first, remap[pr.second]);
     }
   }
   {
@@ -1979,7 +2029,7 @@ int main() {
       while (true) {
         u32 p = nx.fetch_add(1);
         if (p >= (u32)P1) break;
-        dedup_partition(p, S);
+        dedup_partition(tid, p, S);
       }
     });
   }
@@ -2052,6 +2102,17 @@ int main() {
   }
   logt("sessions");
   logt("write");
+#ifdef PROF_STEPS
+  {
+    const char* nm[] = {"sess.passA", "sess.prep", "sess.ev_sort_place", "sess.clicks", "sess.walk", "dedup.copy",
+                        "dedup.hash", "map.pay", "map.clicks"};
+    for (int i = 0; i < 9; i++) {
+      double t = 0;
+      for (int k = 0; k < NT; k++) t += g_st[k][i];
+      fprintf(stderr, "STEP %-20s %.3f s cpu (%.3f wall-eq)\n", nm[i], t, t / NT);
+    }
+  }
+#endif
   fflush(stderr);
   _exit(0);
 }
