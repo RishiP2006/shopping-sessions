@@ -4,4 +4,6 @@ scripts/
 out/
 dev/
 .git
+.github
 *.md
+.github
