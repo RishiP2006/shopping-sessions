@@ -49,6 +49,18 @@ jobs:
           python3 scripts/run_fixtures.py fixtures -- /tmp/pipeline | tail -1
           rm -rf /tmp/o && DATA_DIR=/tmp/dev OUTPUT_DIR=/tmp/o /tmp/pipeline 2>/dev/null
           cd scripts && python3 compare.py /tmp/o /tmp/ans/dev-answer | tail -1
+      - name: Docker image (scorer flags)
+        run: |
+          docker build -q -t shopping-sessions:latest . > /dev/null
+          docker images shopping-sessions:latest --format "image size {{.Size}}"
+          python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh | tail -1
+          rm -rf /tmp/od && scripts/docker_run.sh /tmp/dev /tmp/od 2>/dev/null
+          (cd scripts && python3 compare.py /tmp/od /tmp/ans/dev-answer | tail -1)
+          for i in 1 2 3; do
+            rm -rf /tmp/od; s=$(date +%s.%N)
+            CPUS=4 MEM=12g scripts/docker_run.sh /tmp/p20 /tmp/od 2>/dev/null
+            e=$(date +%s.%N); echo "docker p20 run: $(echo "$e - $s" | bc) s"
+          done
       - name: Bench
         run: |
           cat /tmp/p20/*/*.csv > /dev/null
