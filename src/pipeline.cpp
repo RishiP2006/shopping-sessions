@@ -38,9 +38,7 @@
 
 #include "parquet.hpp"
 
-#ifndef NO_PARSE_LOOKUP
-#define PARSE_LOOKUP 1
-#endif
+// PARSE_LOOKUP (opt-in): resolve persons while parsing (slower on x86)
 
 typedef uint64_t u64;
 typedef int64_t i64;
@@ -235,14 +233,57 @@ __attribute__((always_inline)) static inline bool civil_core(const char* p, i64&
   return true;
 }
 
+// Date-hour cache: "YYYY-MM-DDTHH" (13 bytes, validated on insert) -> ms of that hour.
+// Data spans a few hundred distinct hours, so most timestamps only decode ":MM:SS".
+struct HourEnt {
+  u64 a, b5;
+  i64 ms;
+};
+static thread_local HourEnt g_hc[1024];
+template <bool ZULU>
+__attribute__((always_inline)) static inline bool civil_cached(const char* p, i64& out) {
+#ifndef NO_HOURCACHE
+  u64 a, b, t;
+  memcpy(&a, p, 8);
+  memcpy(&b, p + 8, 8);
+  memcpy(&t, p + 12, 8);
+  u64 b5 = b & 0xFFFFFFFFFFULL;
+  u64 h = ((a * 0x9E3779B97F4A7C15ULL) ^ (b5 * 0x165667B19E3779F9ULL)) >> 54;
+  HourEnt& e = g_hc[h];
+  if (LIKELY(e.a == a && e.b5 == b5)) {
+    // t bytes: 0 'H', 1 ':', 2-3 MM, 4 ':', 5-6 SS, 7 'Z' or sign
+    if ((t & 0x000000FF0000FF00ULL) != 0x0000003A00003A00ULL) return false;
+    if (ZULU && (t >> 56) != 'Z') return false;
+    u64 x = (t ^ 0x3030303030303030ULL) & 0x00FFFF00FFFF0000ULL;
+    if ((x & 0xF0F0F0F0F0F0F0F0ULL) | ((x + 0x0606060606060606ULL) & 0x1010101010101010ULL)) return false;
+    u32 mm = (u32)((x >> 16) & 0xFF) * 10 + (u32)((x >> 24) & 0xFF);
+    u32 ss = (u32)((x >> 40) & 0xFF) * 10 + (u32)((x >> 48) & 0xFF);
+    if (mm > 59 || ss > 59) return false;
+    out = e.ms + (i64)(mm * 60 + ss) * 1000;
+    return true;
+  }
+  bool ok = ZULU ? civil_core<0xFF0000FFu, 0x5A00003Au>(p, out) : civil_core<0x000000FFu, 0x0000003Au>(p, out);
+  if (ok) {
+    u32 mm = (u32)(p[14] - '0') * 10 + (u32)(p[15] - '0');
+    u32 ss = (u32)(p[17] - '0') * 10 + (u32)(p[18] - '0');
+    e.a = a;
+    e.b5 = b5;
+    e.ms = out - (i64)(mm * 60 + ss) * 1000;
+  }
+  return ok;
+#else
+  return ZULU ? civil_core<0xFF0000FFu, 0x5A00003Au>(p, out) : civil_core<0x000000FFu, 0x0000003Au>(p, out);
+#endif
+}
+
 // p[0..n+15] readable
 __attribute__((always_inline)) static inline bool parse_ts(const char* p, u32 n, i64& out) {
   if (n == 20) {
-    if (p[4] == '-') return civil_core<0xFF0000FFu, 0x5A00003Au>(p, out);
+    if (p[4] == '-') return civil_cached<true>(p, out);
   } else if (n == 25) {
     if (p[4] != '-') goto digits;
     i64 base;
-    if (!civil_core<0x000000FFu, 0x0000003Au>(p, base)) return false;
+    if (!civil_cached<false>(p, base)) return false;
     char sg = p[19];
     u32 oh0 = (u32)(uint8_t)p[20] - '0', oh1 = (u32)(uint8_t)p[21] - '0', om0 = (u32)(uint8_t)p[23] - '0',
         om1 = (u32)(uint8_t)p[24] - '0';
@@ -1839,7 +1880,12 @@ int main() {
   }
   logt("map");
 
-  // phase 3
+  // phase 3 (+ output: each thread writes its own user_daily file as soon as it is done;
+  // the last thread to finish merges and writes campaign_daily)
+  std::string UD = OUT + "/user_daily", CDD = OUT + "/campaign_daily";
+  mkdir(OUT.c_str(), 0777);
+  mkdir(UD.c_str(), 0777);
+  mkdir(CDD.c_str(), 0777);
   {
     std::vector<std::pair<size_t, u32>> order;
     for (u32 q = 0; q < (u32)P2; q++) {
@@ -1849,44 +1895,38 @@ int main() {
     }
     std::sort(order.begin(), order.end(), [](auto& a, auto& b) { return a.first > b.first; });
     std::atomic<size_t> nx{0};
+    std::atomic<int> finished{0};
+    std::atomic<size_t> total_rows{0};
     parallel(NT, [&](int tid) {
       TL& me = g_tl[tid];
       me.cd.assign(g_camp_id.size() * (size_t)NDAYS, CD{0, 0, 0, 0});
-      SessScratch S;
-      while (true) {
-        size_t i = nx.fetch_add(1);
-        if (i >= order.size()) break;
-        session_partition(tid, order[i].second, S);
+      {
+        SessScratch S;
+        while (true) {
+          size_t i = nx.fetch_add(1);
+          if (i >= order.size()) break;
+          session_partition(tid, order[i].second, S);
+        }
+      }
+      char nm[64];
+      snprintf(nm, sizeof nm, "/part-%05d.parquet", tid);
+      if (!me.rows.empty()) write_user_file(UD + nm, me.rows);
+      total_rows.fetch_add(me.rows.size());
+      if (finished.fetch_add(1, std::memory_order_acq_rel) == NT - 1) {
+        if (total_rows.load() == 0) write_user_file(UD + nm, me.rows);
+        std::vector<CD> total(g_camp_id.size() * (size_t)NDAYS, CD{0, 0, 0, 0});
+        for (auto& tl : g_tl)
+          for (size_t i = 0; i < total.size(); i++) {
+            total[i].sessions += tl.cd[i].sessions;
+            total[i].purch += tl.cd[i].purch;
+            total[i].rev += tl.cd[i].rev;
+            total[i].assisted += tl.cd[i].assisted;
+          }
+        write_campaign_file(CDD + "/part-00000.parquet", total);
       }
     });
   }
   logt("sessions");
-
-  std::string UD = OUT + "/user_daily", CDD = OUT + "/campaign_daily";
-  mkdir(OUT.c_str(), 0777);
-  mkdir(UD.c_str(), 0777);
-  mkdir(CDD.c_str(), 0777);
-  std::vector<CD> total(g_camp_id.size() * (size_t)NDAYS, CD{0, 0, 0, 0});
-  size_t total_rows = 0;
-  for (auto& tl : g_tl) total_rows += tl.rows.size();
-  parallel(NT, [&](int tid) {
-    TL& me = g_tl[tid];
-    if (!me.rows.empty() || (tid == 0 && total_rows == 0)) {
-      char nm[64];
-      snprintf(nm, sizeof nm, "/part-%05d.parquet", tid);
-      write_user_file(UD + nm, me.rows);
-    }
-    if (tid == NT - 1 || NT == 1) {
-      for (auto& tl : g_tl)
-        for (size_t i = 0; i < total.size(); i++) {
-          total[i].sessions += tl.cd[i].sessions;
-          total[i].purch += tl.cd[i].purch;
-          total[i].rev += tl.cd[i].rev;
-          total[i].assisted += tl.cd[i].assisted;
-        }
-      write_campaign_file(CDD + "/part-00000.parquet", total);
-    }
-  });
   logt("write");
   fflush(stderr);
   _exit(0);
