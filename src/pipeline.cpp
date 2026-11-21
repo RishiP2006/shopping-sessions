@@ -683,6 +683,65 @@ struct PartBuf {
   }
 };
 
+// Write-combining partitioned buffer for 16-byte records: each (thread, partition) stages a
+// cache line of 4 records and writes it out with streaming stores (no read-for-ownership).
+static inline void stream64(void* dst, const void* src) {
+#if defined(__AVX2__)
+  __m256i a = _mm256_load_si256((const __m256i*)src), b = _mm256_load_si256((const __m256i*)src + 1);
+  _mm256_stream_si256((__m256i*)dst, a);
+  _mm256_stream_si256((__m256i*)dst + 1, b);
+#else
+  memcpy(dst, src, 64);
+#endif
+}
+template <class T>
+struct WCBuf : PartBuf<T> {
+  static_assert(sizeof(T) == 16, "WCBuf needs 16-byte records");
+  struct alignas(64) Line {
+    T v[4];
+  };
+  Line* stage = nullptr;
+  uint8_t* scnt = nullptr;
+  void init(size_t cap_per, int nth, int parts, void* mem = nullptr, size_t mem_n = 0) {
+    PartBuf<T>::init((cap_per + 3) & ~(size_t)3, nth, parts, mem, mem_n);
+    size_t R = (size_t)nth * parts;
+    stage = (Line*)big_alloc(R * sizeof(Line));
+    scnt = (uint8_t*)big_alloc(R);
+  }
+  inline u32 put(int t, u32 p, const T& x) {
+    size_t i = (size_t)t * this->P + p;
+    u32 k = scnt[i];
+    T* c = this->cur[i];
+    if (UNLIKELY(k == 0 && c == this->end[i])) {
+      c = this->grow(i);
+      this->cur[i] = c;
+    }
+    u32 ref = (u32)(c - this->base) + k;
+    stage[i].v[k] = x;
+    if (++k == 4) {
+      stream64(c, &stage[i]);
+      this->cur[i] = c + 4;
+      k = 0;
+    }
+    scnt[i] = (uint8_t)k;
+    return ref;
+  }
+  void finish(int t) {
+    for (int p = 0; p < this->P; p++) {
+      size_t i = (size_t)t * this->P + p;
+      u32 k = scnt[i];
+      if (k) {
+        memcpy(this->cur[i], stage[i].v, k * sizeof(T));
+        this->cur[i] += k;
+        scnt[i] = 0;
+      }
+    }
+#if defined(__AVX2__)
+    _mm_sfence();
+#endif
+  }
+};
+
 // ---------------------------------------------------------------- globals
 static int NT = 8;
 static i64 WS, WE, CB;
@@ -717,9 +776,9 @@ struct UserRow {
   i64 sessions, events, rev;
 };
 
-static PartBuf<EKey> g_keys;   // by event_id
-static PartBuf<EPay> g_pay;    // by user (same hash bits as the link table)
-static PartBuf<Rec2> g_rec2;   // by person (reuses g_keys memory)
+static WCBuf<EKey> g_keys;   // by event_id
+static WCBuf<EPay> g_pay;    // by user (same hash bits as the link table)
+static WCBuf<Rec2> g_rec2;   // by person (reuses g_keys memory)
 static PartBuf<ClickRec> g_craw;  // valid clicks by user
 static PartBuf<ClickRec> g_cper;  // valid clicks by person
 static std::atomic<u64>* g_loser = nullptr;
@@ -842,13 +901,9 @@ static const char* parse_events(int tid, const char* p, const char* cend, const 
         pc = price | (cat << 24);
       }
       u64 user = pack7(f[1].p, f[1].n);
-      EPay* py = g_pay.slot(tid, pu_of(user));
-      py->user = user;
-      py->ts = (u32)ts;
-      py->pc = pc;
-      k.ref = g_pay.ref(py);
+      k.ref = g_pay.put(tid, pu_of(user), EPay{user, (u32)ts, pc});
     } while (0);
-    g_keys.push(tid, p1_of(k.eid), k);
+    g_keys.put(tid, p1_of(k.eid), k);
   });
 }
 
@@ -952,7 +1007,7 @@ static void map_partition(int tid, u32 u) {
       for (; a != b; a++, r++) {
         if ((lw[r >> 6] >> (r & 63)) & 1) continue;
         u64 person = g_links.lookup(a->user);
-        g_rec2.push(tid, p2_of(person), Rec2{person, a->ts, a->pc});
+        g_rec2.put(tid, p2_of(person), Rec2{person, a->ts, a->pc});
       }
     });
     g_craw.each(t, u, [&](const ClickRec& c0) {
@@ -1559,6 +1614,8 @@ int main() {
       process_chunk(tid, chunks[ci], vb);
       if (g_files[chunks[ci].file].kind == 2 && links_left.fetch_sub(1) == 1) run_union_find();
     }
+    g_keys.finish(tid);
+    g_pay.finish(tid);
   });
   logt("parse");
 
@@ -1585,6 +1642,7 @@ int main() {
         if (u >= (u32)P) break;
         map_partition(tid, u);
       }
+      g_rec2.finish(tid);
     });
   }
   logt("map");

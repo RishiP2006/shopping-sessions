@@ -9,6 +9,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Machine
         run: |
           lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core|Socket|L2|L3|Flags" | cut -c1-200
@@ -30,6 +32,10 @@ jobs:
         run: |
           g++ -O3 -march=haswell -mtune=skylake-avx512 -std=c++17 -static -pthread -o /tmp/pipeline src/pipeline.cpp
           g++ -O3 -g -march=haswell -std=c++17 -pthread -o /tmp/pipeline_g src/pipeline.cpp
+          BASE=$(cat .github/base_ref 2>/dev/null || echo HEAD~1)
+          mkdir -p /tmp/base && git show $BASE:src/pipeline.cpp > /tmp/base/pipeline.cpp && git show $BASE:src/parquet.hpp > /tmp/base/parquet.hpp
+          g++ -O3 -march=haswell -mtune=skylake-avx512 -std=c++17 -static -pthread -o /tmp/pipeline_base /tmp/base/pipeline.cpp
+          echo "base=$BASE"
       - name: Correctness
         run: |
           python3 scripts/run_fixtures.py fixtures -- /tmp/pipeline | tail -1
@@ -38,11 +44,12 @@ jobs:
       - name: Bench
         run: |
           cat /tmp/p20/*/*.csv > /dev/null
-          for n in 4 8; do
-            echo "== NCPU=$n"
-            for i in 1 2 3 4 5; do
+          for i in 1 2 3 4 5 6; do
+            for v in base new; do
+              B=/tmp/pipeline; [ $v = base ] && B=/tmp/pipeline_base
               rm -rf /tmp/o
-              DATA_DIR=/tmp/p20 OUTPUT_DIR=/tmp/o NCPU=$n /usr/bin/time -f "%e wall %U user %S sys %M KB" /tmp/pipeline 2>&1 | tr '\n' ' '; echo
+              printf "%s " $v
+              DATA_DIR=/tmp/p20 OUTPUT_DIR=/tmp/o NCPU=4 /usr/bin/time -f "%e wall %U user %S sys" $B 2>&1 | tr '\n' ' '; echo
             done
           done
       - name: Profile
