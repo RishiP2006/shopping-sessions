@@ -316,8 +316,19 @@ __attribute__((always_inline)) static inline bool civil_core(const char* p, i64&
 // Decode it without repeating the checks required for dirty event/click timestamps.
 __attribute__((always_inline)) static inline i64 parse_ingest(const char* p) {
 #ifdef DAY_CACHE
+#ifdef TRUST_DATE_INGEST
+  u64 prefix; u32 tail;
+  memcpy(&prefix, p, 8); memcpy(&tail, p + 8, 4);
+  const DateEntry& e = g_date_cache[(tail & 15) * 16 + ((tail >> 8) & 15)];
+  if (LIKELY(e.prefix == prefix && e.tail == (tail & 0x00FFFFFFu))) {
+    u32 sec = (u32)p[11] * 36000 + (u32)p[12] * 3600 + (u32)p[14] * 600 +
+              (u32)p[15] * 60 + (u32)p[17] * 10 + (u32)p[18] - 48 * 40271;
+    return ((i64)e.day * 86400 + sec) * 1000;
+  }
+#else
   i64 out;
   if (cached_day<true>(p, out)) return out;
+#endif
 #endif
   u32 y = (u32)(p[0] - '0') * 1000 + (u32)(p[1] - '0') * 100 + (u32)(p[2] - '0') * 10 + (u32)(p[3] - '0');
   u32 m = (u32)(p[5] - '0') * 10 + (u32)(p[6] - '0');
@@ -400,7 +411,7 @@ digits:
     memcpy(&w, p, 8);
     memcpy(&lo, p + k, 8);
     w <<= 8 * (8 - k);
-    w |= 0x3030303030303030ULL & ((~0ULL) >> (8 * k));
+    if (k < 8) w |= 0x3030303030303030ULL & ((~0ULL) >> (8 * k));
     const u64 Z = 0x3030303030303030ULL;
     u64 xa = w ^ Z, xb = lo ^ Z;
     if ((((xa | xb) & 0xF0F0F0F0F0F0F0F0ULL) | (((xa + 0x0606060606060606ULL) | (xb + 0x0606060606060606ULL)) &
@@ -864,7 +875,7 @@ static bool tok_scalar(const char* p, const char* e, Fld* f) {
     if (nf == N) return false;
     if (s < e && *s == '"') {
       const char* q = (const char*)memchr(s + 1, '"', (size_t)(e - (s + 1)));
-      if (!q) return false;
+      if (!q || memchr(s + 1, ',', (size_t)(q - s - 1))) return false;
       f[nf].p = s + 1;
       f[nf].n = (u32)(q - (s + 1));
       nf++;
@@ -1342,7 +1353,11 @@ static const char* parse_events(int tid, const char* p, const char* cend, const 
 #ifdef PARSE_LOOKUP
   TL& tl = g_tl[tid];
 #endif
-  return scan<7>(p, cend, fend, eof, [&](Fld* f) {
+  return scan<7>(p, cend, fend, eof, [&](Fld* f)
+#ifdef INLINE_PARSE
+    __attribute__((always_inline))
+#endif
+  {
 #ifdef EXP_SCANONLY
     g_tl[tid].rows.reserve(0);
     g_exp_sink += f[0].n + f[6].n;
@@ -1415,7 +1430,11 @@ static const char* parse_events(int tid, const char* p, const char* cend, const 
 
 static const char* parse_clicks(int tid, const char* p, const char* cend, const char* fend, bool eof) {
   const i64 clen = WE - CB;
-  return scan<4>(p, cend, fend, eof, [&](Fld* f) {
+  return scan<4>(p, cend, fend, eof, [&](Fld* f)
+#ifdef INLINE_PARSE
+    __attribute__((always_inline))
+#endif
+  {
     if (f[0].n == 0 || f[1].n == 0 || f[2].n == 0) return;
     i64 ts;
     if (!parse_ts(f[3].p, f[3].n, ts)) return;
@@ -1434,7 +1453,11 @@ static const char* parse_clicks(int tid, const char* p, const char* cend, const 
 
 static const char* parse_links(int tid, const char* p, const char* cend, const char* fend, bool eof) {
   TL& tl = g_tl[tid];
-  return scan<2>(p, cend, fend, eof, [&](Fld* f) {
+  return scan<2>(p, cend, fend, eof, [&](Fld* f)
+#ifdef INLINE_PARSE
+    __attribute__((always_inline))
+#endif
+  {
     if (f[0].n == 0 || f[1].n == 0) return;
     u32 a = g_links.insert(pack7(f[0].p, f[0].n), tl.fresh);
     u32 b = g_links.insert(pack7(f[1].p, f[1].n), tl.fresh);

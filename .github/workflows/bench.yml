@@ -51,6 +51,10 @@ jobs:
             echo "$envs" > /tmp/v/$name/env
             echo "variant $name ref=$ref env=[$envs] flags=[$flags]"
           done < .github/variants
+      - name: Scanner differential tests
+        run: |
+          g++ -O1 -g -march=haswell -std=c++17 -pthread -fsanitize=address,undefined -o /tmp/scanner tools/check_scanner.cpp
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 /tmp/scanner
       - name: Correctness
         run: |
           python3 scripts/run_fixtures.py fixtures -- /tmp/pipeline | tail -1
