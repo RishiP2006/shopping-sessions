@@ -110,6 +110,7 @@ jobs:
         run: |
           G=/tmp/gen/generator/target/release/generate
           $G --seed 37 --events 60000000 --clicks 15000000 --output /tmp/f60 >/dev/null
+          [ -x /tmp/v/baseline/bin ] || { echo "no baseline variant; skipping full-size step"; exit 0; }
           for name in baseline docker; do
             echo "FULL60 $name"
             env DATA_DIR=/tmp/f60 OUTPUT_DIR=/tmp/f60-$name NCPU=4 /usr/bin/time -f "%e wall %M maxrss-kb" /tmp/v/$name/bin
